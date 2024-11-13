@@ -1,0 +1,767 @@
+---
+title: "5_ModelSelection"
+author: "MJB"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+NAME <- '5_ModelSelection' ## Name of the R file goes here (without the file extension!)
+PROJECT <- 'Archive' ## Project folder
+PROJECT_DIR <- "E:/CE_analysis" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+
+##Set working directory
+#setwd(file.path(PROJECT_DIR, PROJECT))
+knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
+
+# Set  up pipeline folder if missing
+### The code below will automatically create a pipeline folder for this code file if it does not exist.
+
+if (dir.exists(file.path('empirical', '2_pipeline'))){
+  pipeline <- file.path('empirical', '2_pipeline', NAME)
+} else {
+  pipeline <- file.path('2_pipeline', NAME)
+}
+
+if (!dir.exists(pipeline)) {
+  dir.create(pipeline)
+  for (folder in c('out', 'store', 'tmp')){
+    dir.create(file.path(pipeline, folder))
+  }
+}
+
+library(tidyverse)            # data manipulation
+library(lubridate) #dates and times
+library(MuMIn) #model inference/aic
+library(tictoc) #function times
+library(MASS) #glm.nb
+library(dismo) #boosted regression trees
+library(gbm) #boosted regression trees
+library(DHARMa) ##glm.nb model validation
+# library(performance) ##model validation
+
+# library(magrittr) ## %$%
+select <- dplyr::select
+filter <- dplyr::filter
+
+options(na.action = "na.fail")
+```
+
+# Boosted Regression Tree exploration ----
+
+Currently, we have \> 30 potential covariates, which is too many potential model combinations compare all possible combinations. TO reduce the number of 'nuisance' covariates (natural habitat and other environmental factors), I'm using Boosted Regression Trees to identify the most influential 'nuisance' covariates for each species (see workflow recommended in Feld et al 2016).
+
+I've not used disturbance variables in these models - they will be compared in the final step using AIC. I've also removed h_forest and h_forest_closed from the models so that there is a degree of freedom in the habitat variables. The issue I was encountering was that using AIC to select the most parsimonious model, the mature forest specialists often were attracted to h_forest, versus avoiding d_surface and h_open, because this is the simpler model. The conclusions is that these species are not effected by disturbance, however if we reduce the amount of forest by increasing disturbance, these species will be losers.
+
+I chose to remove forest because 1. it is the most common of the habitat types (i.e. the baseline onto which other habitat variables can be added) and 2. it is the most different from the habitat structure of disturbed areas. By keeping h_open, we can also look at whether species respond similarly to open and disturbed habitat types, or whether they are perceived as being different (i.e. if both end up in the final model, is one more attractive than the other, or is one avoided more than the other.
+
+The tree complexity, learning rate, and bag fraction were determined more or less with trial and error to try and obtain a minimum of 1000 trees for all species. This could be optimized (see Elith et al 2008, or 'Habitat selection at different scales for a declining aerial insectivorous bird as determined by autonomous recording technology, Knight and Bayne 2017 for methods). However, because we aren't actually predicting with the BRT models, but rather just identifying the most influential variables, it might not be necessary.
+
+Unfortunately, I don't think these BRT will run with a negbinom model, so I am using poisson.
+
+```{r}
+counts.spec <- readRDS("E:/Archive/2_pipeline/4_DataExploration/store/counts_simp.RDS")
+hab.sum <- readRDS("E:/Archive/2_pipeline/4_DataExploration/store/hab.sum_simp.RDS")
+
+set.seed(1234)
+brt <- list()
+for(i in 1:length(counts.spec)){
+count.df <- counts.spec[[i]] %>%
+  select(siteID, offset, abundance, buffer, perARU, starts_with("noise"), starts_with("h_"),  starts_with("wden"), -h_forest, - h_forest_closed) %>% 
+  pivot_wider(names_from = buffer, values_from = c(starts_with("h_"),  starts_with("wden"))) 
+count.df <- left_join(count.df, hab.sum %>% select(siteID, year, elev, starts_with("mn_"), lon, lat) %>% distinct())
+count.df <- as.data.frame(count.df)
+
+my.brt <-gbm.step(data = count.df, gbm.x = 4:length(names(count.df)), gbm.y = "abundance", offset = count.df$offset,
+                  family = "poisson", tree.complexity = 3, learning.rate = .0005, bag.fraction = .65, n.folds = 15)
+
+brt[[i]] <- my.brt
+}
+names(brt) <- names(counts.spec)
+saveRDS(brt, file.path("E:/Archive",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
+brt <- readRDS(file.path("E:/Archive",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
+brt <- brt[!sapply(brt, is.null)] ##BOWA and PIGR didn't converge
+
+##BRT goodness of fit
+# Holdout deviance 
+brt.dev <- sapply(brt, function(my.gbm.full){
+  my.gbm.full$self.statistics$mean.null->null.dev
+my.gbm.full$cv.statistics$deviance.mean->resid.dev
+
+1-resid.dev/null.dev
+})
+
+brt.rmse <- pmap(list(counts.spec[names(brt)], brt), 
+                 function(df, my.gbm.full){
+sqrt(1/nrow(df) * sum((df$abundance - my.gbm.full$fitted)^2))
+}) %>% unlist()
+  
+brt.dev > .5 #ALFL, HETH, SWTH, WCSP have higher deviance
+brt.rmse > 20 #ALFL, LISP, SWTH, WCSP, WWCR have higher error
+
+#number of trees
+brt.trees <- sapply(brt, function(x) x$n.trees)
+
+plot(brt.trees, brt.dev)
+plot(brt.trees, brt.rmse) 
+## deviance and rmse increases with number of trees
+plot(brt.dev, brt.rmse)
+
+##only keep variables with influence > 2%  ()
+topVar <- lapply(brt, function(my.brt){
+  sum.my.brt <- summary(my.brt)
+  sum.my.brt[sum.my.brt$rel.inf>2,]$var
+})
+
+# topVar_tc4_lr.001_bf.65 <- topVar
+
+brt.trees>1000 #NOFL, WEWP, WISN
+# topVar_tc4_lr.001_bf.65$WISN
+# topVar_tc3_lr.001_bf.65$WISN
+# topVar_tc3_lr.0005_bf.65$WISN
+#low number of trees indicates instability, not suggested to use models with fewer than 1000 trees. Top variables are constent across these different models though, so let's keep :)
+
+gbm.plot(brt$YEWA, smooth = T, n.plots = 12, plot.layout=c(3, 4)) #plot 12 most influential variables
+
+int.brt <- lapply(brt, function(my.brt) gbm.interactions(my.brt))
+saveRDS(int.brt, file.path(pipeline, "store", "intbrt_tc4_lr.001_bf.65.RDS"))
+
+```
+
+# GLMs
+
+Due to correlation between linear density and surface disturbance, we are building separate models sets for each disturbance type.
+
+-   No variables with a correlation \> .6 can be included in the same model.
+-   Nested variable (e.g. h_open and h_open_noburn, or h_wet and h_water) can't be included in the same model
+-   If elevation is included in the top 2%, we also consider a quadratic function
+-   I consider interactions between lat, lon, elevation and temperature if they are present in the model as they have some ecological validity
+
+All combinations of surface of linear density are considered than meet the above criteria.
+
+Dredge is used to compare all possible valide model combinations (with the above restrictions). We select the most parsimonious model within 2 AIC of the top model as the 'best' model. I also check whether there is a nested models that is more parsimonious within 4 AIC this model (if Y \~ A + B = AIC 1, and Y \~ A = AIC 3, then B is a redundant variables because it is penalized by 2 without explaining more variation)
+
+```{r}
+counts.spec <- counts.spec[names(topVar)]
+## only covariates with > 2% influence
+##correlation matrix functions----
+correlation <- function(i, j, data) {
+  data <- as.data.frame(data)  #indexing doesn't work on tibble
+  if(j >= i) return(NA)
+  if(!is.numeric(data[, i])| !is.numeric(data[, j])) return(0) ##i.e. no correlation
+  ct <- cor(data[, i], data[, j])
+  ct
+}
+# Need vectorized function to use with 'outer'
+vCor <- Vectorize(correlation, c("i", "j"))
+
+spp <- names(counts.l) ## 
+
+
+dat <- counts.spec$ALFL %>% select(siteID, starts_with("d_"), buffer) %>% 
+  pivot_wider(names_from = buffer, values_from = starts_with("d_")) %>% select(-siteID)
+smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+nm <- colnames(dat)
+dimnames(smat) <- list(nm, nm)
+smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+smat
+
+##surface ----
+counts.l <- pmap(list(counts.spec, topVar), function(df, vars) {
+  
+   count.df <- df %>%
+    select(siteID, offset, abundance, buffer, perARU, starts_with("noise"),
+           starts_with("h_"), starts_with("d_"), starts_with("wden")) %>% 
+    pivot_wider(names_from = buffer, values_from = 
+                  c(starts_with("h_"), starts_with("d_"), starts_with("wden"))) %>% 
+    mutate(noise.mode = as.factor(noise.mode))
+  count.df <- left_join(count.df, hab.sum %>% 
+                          select(siteID, year, elev, starts_with("mn_"), lon, lat) %>% distinct())
+   as.data.frame(count.df) %>% select(abundance, offset, all_of(vars), starts_with("d_"), -starts_with("d_lden"))
+})
+
+##only 2-way interactions with > 1% influence
+# int.brt <- readRDS(file.path(pipeline, "store", "intbrt_tc4_lr.001_bf.65.RDS"))
+# int.brt <- lapply(int.brt, function(x) x$rank.list %>% filter(int.size > 2))
+
+## what disturbance combinations are possible
+
+dat <- counts.l$ALFL %>% select(starts_with("d_"))
+smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+nm <- colnames(dat)
+dimnames(smat) <- list(nm, nm)
+smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+
+
+
+## dredge
+mset.l <- list()
+m1.l <- list()
+m2.l <- list()
+
+for(i in spp){
+  x <- counts.l[[i]] 
+  int <- int.brt[[i]]
+  
+  dat <- x %>%
+    select(-abundance, -offset)
+  # dat <- dat %>% select(where(is.numeric))
+  
+  
+  ##smat is a matrix showing which variables can be included in the same model (TRUE) and which can't occur together (FALSE)
+  ## first we exclude correlated variables
+  smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+  nm <- colnames(dat)
+  dimnames(smat) <- list(nm, nm)
+  smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+  
+  ## Then we exclude nested variables
+  smat[str_starts(nm, "h_open"), str_starts(nm, "h_open")] <- FALSE
+  smat[str_starts(nm, "wden"), str_starts(nm, "wden")] <- FALSE
+  smat[c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all")),
+       c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all"))] <- FALSE
+  smat[c(str_detect(nm, "h_wet")| str_detect(nm, "h_water")),
+     c(str_detect(nm, "h_wet")| str_detect(nm, "h_water"))] <- FALSE
+    smat[upper.tri(smat, diag = T)] <- NA
+
+  ## The matrix is then converted to vector form (cor.exp) which provides more flexibility, i.e. for also specifing dependancy chains so that quadratic terms are only included with their linear counterpart  
+    
+  j <- as.vector(smat == FALSE & !is.na(smat))
+  nm <- colnames(smat)
+  if(sum(j)>0 & "elev" %in% nm) {
+    cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+                    nm[row(smat)[j]], ")",
+                    sep = "", collapse = " || ") ## don't include correlated or nested variables
+    cor.exp <-  paste("dc(elev, I(elev^2)) & !(", cor.exp, ")") ## quadratic term of elevation should on be included if non-quadratic term is in the model
+  } else if(sum(j)>0) {
+    cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+                    nm[row(smat)[j]], ")",
+                    sep = "", collapse = " || ")
+    cor.exp <-  paste("!(", cor.exp, ")")
+  } else if("elev" %in% nm){
+    cor.exp <- "dc(elev, I(elev^2))"
+  } else { cor.exp <- NULL}
+  
+  ## covar are the covariates that will be compared
+  covar <- paste(nm, collapse = "+")
+  
+  if("elev" %in% nm) { 
+    covar <- paste(covar, "+ I(elev^2)") ## elevation might be quadratic
+  }
+  
+  ##add environmental interactions
+  env_int <- filter(int, (var1.names %in% c("lat", "lon", "elev") | str_starts(var1.names, "mn_")) &
+                      (var2.names %in% c("lat", "lon", "elev") | str_starts(var2.names, "mn_")) &
+                      var1.names %in% nm & var2.names %in% nm)
+
+  int <- env_int
+
+  #add interaction terms to covar
+  if(dim(int)[1] > 0) {
+    int <- int %>% mutate(int.covar = paste(var1.names, var2.names, sep = ":")) %>% pull(int.covar)
+    covar <- paste(covar, "+", paste(int, collapse = "+"))
+  }
+  
+  ##specify the complete model with all covariates.  THis model will includes variables that should be run together, I don't think there is a way around that, and it does sometimes cause errors
+
+  mf <- tryCatch(glm.nb(as.formula(paste("abundance ~", covar, "+ offset(offset)")), data = x), 
+                 error = function(e) NULL)
+
+  ## sometimes mf fails if not given a theta
+    if(is.null(mf)) {
+          mf <- tryCatch(glm.nb(as.formula(paste("abundance ~", covar, "+ offset(offset)")), 
+                                data = x, init.theta = 0.4), 
+                   error = function(e) NULL)
+    }
+    
+    if(is.null(mf)) { next } ## if supplying theta doesn't work, discard the species
+
+        
+  
+  ##use dredge to check all possible cmbinations of variables
+    if(!is.null(cor.exp)) {
+    cor.exp <- parse(text = cor.exp)
+  tic(i)
+  m.set <- dredge(global.model = mf,
+      fixed = c("offset(offset)"), 
+      subset=  cor.exp)
+  toc()
+    } else {
+        tic(i)
+  m.set <- dredge(global.model = mf, fixed = c("offset(offset)"))
+  toc()
+    }
+  
+  mset.l[[i]] <- m.set
+
+  m.set.sub <- m.set %>% filter(delta <2) %>% arrange(df, delta)
+  m1 <-  get.models(m.set, subset = delta == m.set.sub$delta[1] & df == m.set.sub$df[1])[[1]]
+  m.set.sub2 <- m.set %>% filter(delta <4) %>% arrange(df, delta)
+  if(m.set.sub2[1,]$delta - m.set.sub[1,]$delta < 2) { #only better if within 2 AIC of m1
+    m2 <-  get.models(m.set, subset = delta == m.set.sub2$delta[1] & df == m.set.sub2$df[1])[[1]]
+  } else {
+    m2 <- m1
+  }
+
+  m1.l[[i]] <- m1 ## most parsemonious within 2 AIC
+  m2.l[[i]] <- m2 ## most parsemonious within 4 AIC, and within 2 AIC of m1
+}
+
+m.l <- list()
+m.l <- mapply(function(m1, m2) {
+  if(isTRUE(all.equal(m1, m2))) { ## if same model selected, use 1
+    return (m1)
+    } else {
+      if(all(names(coef(m2)) %in% names(coef(m1)))) { #if m2 is nested within m1, m1 has extra un-informative variable, so use m2
+        return(m2)
+      } else {
+        return(m1) # if not nested, use most parsimonious within 2 AIC
+      }
+      }
+  }, m1.l, m2.l, SIMPLIFY = F)
+
+saveRDS(mset.l, file.path("E:/Archive",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ##AIC comparison per species.
+saveRDS(m.l, file.path("E:/Archive",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ## 'top' models
+
+
+
+
+
+## all linear variable combinations ----
+
+counts.l <- pmap(list(counts.spec, topVar), function(df, vars) {
+  
+   count.df <- df %>%
+    select(siteID, offset, abundance, buffer, perARU, starts_with("noise"),
+           starts_with("h_"), starts_with("d_lden"), starts_with("wden")) %>% 
+    pivot_wider(names_from = buffer, values_from = 
+                  c(starts_with("h_"), starts_with("d_lden"), starts_with("wden"))) %>% 
+    mutate(noise.mode = as.factor(noise.mode))
+  count.df <- left_join(count.df, hab.sum %>% 
+                          select(siteID, year, elev, starts_with("mn_"), lon, lat) %>% distinct())
+   as.data.frame(count.df) %>% select(abundance, offset, all_of(vars), starts_with("d_lden"))
+})
+
+## what disturbance combinations are possible
+
+dat <- counts.l$ALFL %>% select(starts_with("d_"))
+smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+nm <- colnames(dat)
+dimnames(smat) <- list(nm, nm)
+smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+smat[c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all")),
+     c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all"))] <- FALSE
+smat
+
+## dredge
+
+
+mset.l <- list()
+m1.l <- list()
+m2.l <- list()
+
+# spp3 <- spp[sapply(topVar, length) >=15]
+for(i in spp){
+  x <- counts.l[[i]] 
+  int <- int.brt[[i]]
+  
+  dat <- x %>%
+    select(-abundance, -offset)
+  # dat <- dat %>% select(where(is.numeric))
+  smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+  nm <- colnames(dat)
+  dimnames(smat) <- list(nm, nm)
+  smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+  
+    ##nested variables
+  smat[str_starts(nm, "h_open"), str_starts(nm, "h_open")] <- FALSE
+  smat[str_starts(nm, "wden"), str_starts(nm, "wden")] <- FALSE
+  smat[c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all")),
+       c(str_detect(nm, "nonroad")| str_detect(nm, "lden_all"))] <- FALSE
+  smat[c(str_detect(nm, "h_wet")| str_detect(nm, "h_water")),
+     c(str_detect(nm, "h_wet")| str_detect(nm, "h_water"))] <- FALSE
+  
+  smat[upper.tri(smat, diag = T)] <- NA
+
+  j <- as.vector(smat == FALSE & !is.na(smat))
+  nm <- colnames(smat)
+  if(sum(j)>0 & "elev" %in% nm) {
+    cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+                    nm[row(smat)[j]], ")",
+                    sep = "", collapse = " || ")
+    cor.exp <-  paste("dc(elev, I(elev^2)) & !(", cor.exp, ")")
+  } else if(sum(j)>0) {
+    cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+                    nm[row(smat)[j]], ")",
+                    sep = "", collapse = " || ")
+    cor.exp <-  paste("!(", cor.exp, ")")
+  } else if("elev" %in% nm){
+    cor.exp <- "dc(elev, I(elev^2))"
+  } else { cor.exp <- NULL}
+  
+  # stressors <- c(nm[str_starts(nm, "mn_")], nm[str_starts(nm, "d_")])
+  # hab.var <- nm[!nm %in% stressors]
+  # 
+  # covar <- paste0(paste(hab.var, collapse = "+"), "+ (", 
+  #                 paste(stressors, collapse = "+"), ")^2") ## include all possible interactions btwn stressors
+  ##elevation/Lat/temp interactions
+  
+  covar <- paste(nm, collapse = "+")
+  
+  if("elev" %in% nm) { 
+    covar <- paste(covar, "+ I(elev^2)")
+  }
+  
+  ## Interactions
+#     d_int <- filter(int, (str_starts(var1.names, "d_") | str_starts(var1.names, "mn_")) &
+# (str_starts(var2.names, "d_") | str_starts(var2.names, "mn_")) &
+# var1.names %in% nm & var2.names %in% nm)
+    
+        env_int <- filter(int, (var1.names %in% c("lat", "lon", "elev") | str_starts(var1.names, "mn_")) &
+(var2.names %in% c("lat", "lon", "elev") | str_starts(var2.names, "mn_")) &
+var1.names %in% nm & var2.names %in% nm)
+  
+        # int <- rbind(d_int, env_int)
+        int <- env_int
+
+  if(dim(int)[1] > 0) {
+    int <- int %>% mutate(int.covar = paste(var1.names, var2.names, sep = ":")) %>% pull(int.covar)
+    covar <- paste(covar, "+", paste(int, collapse = "+"))
+  }
+  
+    # mf <- as.formula(paste("abundance ~", covar.simple, "+ offset(offset)"))
+        
+    mf <- tryCatch(glm.nb(as.formula(paste("abundance ~", covar, "+ offset(offset)")), data = x), 
+                   error = function(e) NULL)
+
+    if(is.null(mf)) {
+          mf <- tryCatch(glm.nb(as.formula(paste("abundance ~", covar, "+ offset(offset)")), data = x, init.theta = 0.4), 
+                   error = function(e) NULL)
+              # mf$call <- glm.nb(as.formula(paste("abundance ~", "lat + offset(offset)")), data = x)
+    # c1 <- call("glm.nb", formula = as.formula(paste("abundance ~", covar.test, "+ offset(offset)")), data = x)
+    # mf$call <- parse( text = 'glm.nb(as.formula(paste("abundance ~", covar.test, "+ offset(offset)")), data = x)')
+    # formula(mf) <- as.formula(paste("abundance ~", covar.test, "+ offset(offset)"))
+          
+    }
+    
+    if(is.null(mf)) { next }
+    
+  
+    if(!is.null(cor.exp)) {
+    cor.exp <- parse(text = cor.exp)
+  tic(i)
+  m.set <- dredge(global.model = mf,
+      fixed = c("offset(offset)"), 
+      subset=  cor.exp)
+  toc()
+    } else {
+        tic(i)
+  m.set <- dredge(global.model = mf,
+      fixed = c("offset(offset)"))
+  toc()
+    }
+  
+  mset.l[[i]] <- m.set
+
+  m.set.sub <- m.set %>% filter(delta <2) %>% arrange(df, delta)
+  m1 <-  get.models(m.set, subset = delta == m.set.sub$delta[1] & df == m.set.sub$df[1])[[1]]
+  m.set.sub2 <- m.set %>% filter(delta <4) %>% arrange(df, delta)
+  if(m.set.sub2[1,]$delta - m.set.sub[1,]$delta < 2) { #only better if within 2 AIC of m1
+    m2 <-  get.models(m.set, subset = delta == m.set.sub2$delta[1] & df == m.set.sub2$df[1])[[1]]
+  } else {
+    m2 <- m1
+  }
+
+  m1.l[[i]] <- m1 ## most parsemonious within 2 AIC
+  m2.l[[i]] <- m2 ## most parsemonious within 4 AIC, and within 2 AIC of m1
+}
+
+m.l <- list()
+m.l <- mapply(function(m1, m2) {
+  if(isTRUE(all.equal(m1, m2))) { ## if same model selected, use 1
+    return (m1)
+    } else {
+      if(all(names(coef(m2)) %in% names(coef(m1)))) { #if m2 is nested within m1, m1 has extra un-informative variable, so use m2
+        return(m2)
+      } else {
+        return(m1) # if not nested, use most parsimonious within 2 AIC
+      }
+      }
+  }, m1.l, m2.l, SIMPLIFY = F)
+
+saveRDS(mset.l, file.path(pipeline, "store", "mset_top2BTR_lden_noforest.RDS")) ##AIC comparison per species.
+saveRDS(m.l, file.path(pipeline, "store", "mset_top2BTR_lden_noforest.RDS")) ## 'top' models
+
+
+
+### if brt included disturbance variables----
+# mset.l <- list()
+# m1.l <- list()
+# m2.l <- list()
+# 
+# # spp3 <- spp[sapply(topVar, length) >=15]
+# for(i in spp){
+#   x <- counts.l[[i]] 
+#   int <- int.brt[[i]]
+#   
+#   dat <- x %>%
+#     select(-abundance, -offset)
+#   # dat <- dat %>% select(where(is.numeric))
+#   smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+#   nm <- colnames(dat)
+#   dimnames(smat) <- list(nm, nm)
+#   smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+# 
+#   j <- as.vector(smat == FALSE & !is.na(smat))
+#   nm <- colnames(smat)
+#   if(sum(j)>0 & "elev" %in% nm) {
+#     cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+#                     nm[row(smat)[j]], ")",
+#                     sep = "", collapse = " || ")
+#     cor.exp <-  paste("dc(elev, I(elev^2)) & !(", cor.exp, ")")
+#   } else if(sum(j)>0) {
+#     cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+#                     nm[row(smat)[j]], ")",
+#                     sep = "", collapse = " || ")
+#     cor.exp <-  paste("!(", cor.exp, ")")
+#   } else if("elev" %in% nm){
+#     cor.exp <- "dc(elev, I(elev^2))"
+#   } else { cor.exp <- NULL}
+#   
+#   # stressors <- c(nm[str_starts(nm, "mn_")], nm[str_starts(nm, "d_")])
+#   # hab.var <- nm[!nm %in% stressors]
+#   # 
+#   # covar <- paste0(paste(hab.var, collapse = "+"), "+ (", 
+#   #                 paste(stressors, collapse = "+"), ")^2") ## include all possible interactions btwn stressors
+#   ##elevation/Lat/temp interactions
+#   
+#   covar <- paste(nm, collapse = "+")
+#   
+#   if("elev" %in% nm) { 
+#     covar <- paste(covar, "+ I(elev^2)")
+#   }
+#   
+#   ## Interactions
+#     d_int <- filter(int, (str_starts(var1.names, "d_") | str_starts(var1.names, "mn_")) &
+# (str_starts(var2.names, "d_") | str_starts(var2.names, "mn_")) &
+# var1.names %in% nm & var2.names %in% nm)
+#     
+#         env_int <- filter(int, (var1.names %in% c("lat", "lon", "elev") | str_starts(var1.names, "mn_")) &
+# (var2.names %in% c("lat", "lon", "elev") | str_starts(var2.names, "mn_")) &
+# var1.names %in% nm & var2.names %in% nm)
+#   
+#         int <- rbind(d_int, env_int)
+# 
+#   if(dim(int)[1] > 0) {
+#     int <- int %>% mutate(int.covar = paste(var1.names, var2.names, sep = ":")) %>% pull(int.covar)
+#     covar <- paste(covar, "+", paste(int, collapse = "+"))
+#   }
+#   
+#     mf <- as.formula(paste("abundance ~", covar, "+ offset(offset)"))
+#     mf <- glm.nb(mf, data = x)
+#   
+#     if(!is.null(cor.exp)) {
+#     cor.exp <- parse(text = cor.exp)
+#   tic(i)
+#   m.set <- dredge(global.model = mf,
+#       fixed = c("offset(offset)"), 
+#       subset=  cor.exp)
+#   toc()
+#     } else {
+#         tic(i)
+#   m.set <- dredge(global.model = mf,
+#       fixed = c("offset(offset)"))
+#   toc()
+#     }
+#   
+#   mset.l[[i]] <- m.set
+# 
+#   m.set.sub <- m.set %>% filter(delta <2) %>% arrange(df, delta)
+#   m1 <-  get.models(m.set, subset = delta == m.set.sub$delta[1] & df == m.set.sub$df[1])[[1]]
+#   m.set.sub2 <- m.set %>% filter(delta <4) %>% arrange(df, delta)
+#   if(m.set.sub2[1,]$delta - m.set.sub[1,]$delta < 2) { #only better if within 2 AIC of m1
+#     m2 <-  get.models(m.set, subset = delta == m.set.sub2$delta[1] & df == m.set.sub2$df[1])[[1]]
+#   } else {
+#     m2 <- m1
+#   }
+# 
+#   m1.l[[i]] <- m1 ## most parsemonious within 2 AIC
+#   m2.l[[i]] <- m2 ## most parsemonious within 4 AIC, and within 2 AIC of m1
+# }
+# 
+# m.l <- list()
+# m.l <- mapply(function(m1, m2) {
+#   if(isTRUE(all.equal(m1, m2))) { ## if same model selected, use 1
+#     return (m1)
+#     } else {
+#       if(all(names(coef(m2)) %in% names(coef(m1)))) { #if m2 is nested within m1, m1 has extra un-informative variable, so use m2
+#         return(m2)
+#       } else {
+#         return(m1) # if not nested, use most parsimonious within 2 AIC
+#       }
+#       }
+#   }, m1.l, m2.l, SIMPLIFY = F)
+# 
+# saveRDS(mset.l, file.path(pipeline, "store", "mset_top1.5BTR.RDS")) ##AIC comparison per species.
+# saveRDS(m.l, file.path(pipeline, "store", "bestm_top1.5BTR.RDS")) ## 'top' models
+
+
+```
+
+```{r}
+
+x <- counts.l$TOWA %>% select(-starts_with("h_forest"), -starts_with("h_evergreen"))
+
+dat <- x %>%
+  select(-abundance, -offset)
+# dat <- dat %>% select(where(is.numeric))
+smat <- outer(1:ncol(dat), 1:ncol(dat), vCor, dat)
+nm <- colnames(dat)
+dimnames(smat) <- list(nm, nm)
+smat <- ifelse(abs(smat) > 0.6, FALSE, TRUE) ## exclude correlated variables
+
+j <- as.vector(smat == FALSE & !is.na(smat))
+nm <- colnames(smat)
+cor.exp <- paste("(", nm[col(smat)[j]], " && ",
+                  nm[row(smat)[j]], ")",
+                  sep = "", collapse = " || ")
+cor.exp <-  paste("!(", cor.exp, ")")
+
+covar <- paste(nm, collapse = "+")
+
+    # mf <- as.formula(paste("abundance ~", covar.simple, "+ offset(offset)"))
+        
+mf <- tryCatch(glm.nb(as.formula(paste("abundance ~", covar, "+ offset(offset)")), data = x), 
+                   error = function(e) NULL)
+cor.exp <- parse(text = cor.exp)
+  tic()
+m.set <- dredge(global.model = mf,
+    fixed = c("offset(offset)"), 
+    subset=  cor.exp)
+  toc()
+
+m.set %>% filter(delta <2) %>% arrange(df, delta)
+
+```
+
+# Model Validation
+
+```{r}
+m.l <- readRDS(file.path("E:/Archive",pipeline, "store", "bestm_topBTR.RDS"))
+
+## check residuals
+
+resid <- lapply(m.l, function(m) simulateResiduals(m, n= 1000, plot = T))
+sapply(resid, testDispersion)
+
+plot(resid$ALFL)
+par(mfrow = c(1,1))
+plotQQunif(resid$ALFL)
+plotResiduals(resid$ALFL)
+testUniformity(resid$ALFL) ##good!
+testOutliers(resid$ALFL) ##good!
+testDispersion(resid$ALFL) ##significant
+testZeroInflation(resid$ALFL) ##significant
+testQuantiles(resid$ALFL) ##significant
+
+
+
+resid.plots <- mapply(function(df, m) {
+  df <- cbind(df, resid)
+  p1<-ggplot(df, aes(lat, resid)) + geom_point() + geom_smooth()
+  p2<-ggplot(df, aes(lon, resid)) + geom_point() + geom_smooth()
+  p3<-ggplot(df, aes(elev, resid)) + geom_point() + geom_smooth()
+  p4<- ggplot(df, aes(year, resid)) + geom_boxplot()
+  list(p1,p2,p3,p4)
+}, counts.l, resid, SIMPLIFY = F)
+
+
+```
+
+```{r}
+##plot residuals against lat, long, date, survey hour, method. 
+resid.plots <- mapply(function(df, m) {
+  df <- cbind(df, resid = resid(m))
+  p1<-ggplot(df, aes(lat, resid)) + geom_point() + geom_smooth()
+  p2<-ggplot(df, aes(lon, resid)) + geom_point() + geom_smooth()
+  p3<-ggplot(df, aes(yday, resid)) + geom_point() + geom_smooth()
+  p4<- ggplot(df, aes(method, resid)) + geom_boxplot()
+  list(p1,p2,p3,p4)
+}, pa.df, m.pa.l, SIMPLIFY = F)
+
+do.call(grid.arrange, resid.plots$ALFL) ##yday effect
+do.call(grid.arrange, resid.plots$AMRO) 
+do.call(grid.arrange, resid.plots$BOCH)
+do.call(grid.arrange, resid.plots$CAJA) #some method effect?
+do.call(grid.arrange, resid.plots$CHSP)
+do.call(grid.arrange, resid.plots$CORE) #lat effect
+do.call(grid.arrange, resid.plots$DEJU)
+do.call(grid.arrange, resid.plots$FOSP)
+do.call(grid.arrange, resid.plots$GCTH)
+do.call(grid.arrange, resid.plots$HETH) #lon effect?
+do.call(grid.arrange, resid.plots$LISP)
+do.call(grid.arrange, resid.plots$NOWA)
+do.call(grid.arrange, resid.plots$OCWA) #yday effect?
+do.call(grid.arrange, resid.plots$PIGR)
+do.call(grid.arrange, resid.plots$RCKI)
+do.call(grid.arrange, resid.plots$SWTH)
+do.call(grid.arrange, resid.plots$TOWA)
+do.call(grid.arrange, resid.plots$VATH)
+do.call(grid.arrange, resid.plots$WCSP)
+do.call(grid.arrange, resid.plots$WEWP)
+do.call(grid.arrange, resid.plots$WIWA)
+do.call(grid.arrange, resid.plots$WWCR)
+do.call(grid.arrange, resid.plots$YRWA)
+
+# ##ALFL
+# ##yday effect, quadradic
+# m1 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$ALFL))$term.labels, collapse = "+"), "+ yday + (1|siteID)")),
+#              data = pa.df$ALFL, na.action = "na.fail",
+#              family = binomial(link = pd$ALFL))
+# m2 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$ALFL))$term.labels, collapse = "+"), "+ yday + I(yday^2) + (1|siteID)")),
+#              data = pa.df$ALFL, na.action = "na.fail",
+#              family = binomial(link = pd$ALFL))
+# 
+# AICc(m.pa.l$ALFL, m1, m2) %>% arrange(AICc) ##m2
+# m.pa.l$ALFL <- m2
+# 
+# ##CAJA
+# ##method effect
+# m1 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$CAJA))$term.labels, collapse = "+"), "+ method + (1|siteID)")),
+#              data = pa.df$CAJA, na.action = "na.fail",
+#              family = binomial(link = pd$CAJA))
+# AICc(m.pa.l$CAJA, m1) %>% arrange(AICc) ##no effect
+# 
+# 
+# ##CORE
+# ##lat effect
+# m1 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$CORE))$term.labels, collapse = "+"), "+ lat + (1|siteID)")),
+#              data = pa.df$CORE, na.action = "na.fail",
+#              family = binomial(link = pd$CORE))
+# AICc(m.pa.l$CORE, m1) %>% arrange(AICc) ##m1 better
+# m.pa.l$CORE <- m1
+# 
+# ##HETH
+# ##lon effect
+# m1 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$HETH))$term.labels, collapse = "+"), "+ lon + (1|siteID)")),
+#              data = pa.df$HETH, na.action = "na.fail",
+#              family = binomial(link = pd$HETH))
+# AICc(m.pa.l$HETH, m1) %>% arrange(AICc) ##m1 better
+# m.pa.l$HETH <- m1
+# 
+# ##OCWA
+# ##yday effect, quadradic
+# m1 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$OCWA))$term.labels, collapse = "+"), "+ yday + (1|siteID)")),
+#              data = pa.df$OCWA, na.action = "na.fail",
+#              family = binomial(link = pd$OCWA))
+# m2 <- glm(as.formula(paste("cbind(present, absent) ~", paste(attributes(terms(m.pa.l$OCWA))$term.labels, collapse = "+"), "+ yday + I(yday^2) + (1|siteID)")),
+#              data = pa.df$OCWA, na.action = "na.fail",
+#              family = binomial(link = pd$OCWA))
+# 
+# AICc(m.pa.l$OCWA, m1, m2) %>% arrange(AICc) ##m2
+# m.pa.l$OCWA <- m2
+
+
+```

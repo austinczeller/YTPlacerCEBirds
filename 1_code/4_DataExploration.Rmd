@@ -1,0 +1,777 @@
+---
+title: "4_DataExploration"
+author: "MJB"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+NAME <- '4_DataExploration' ## Name of the R file goes here (without the file extension!)
+PROJECT <- 'Archive' ## Project folder
+PROJECT_DIR <- "E:/CE_analysis" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+
+##Set working directory
+#setwd(file.path(PROJECT_DIR, PROJECT))
+knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
+
+# Set  up pipeline folder if missing
+### The code below will automatically create a pipeline folder for this code file if it does not exist.
+
+if (dir.exists(file.path('empirical', '2_pipeline'))){
+  pipeline <- file.path('empirical', '2_pipeline', NAME)
+} else {
+  pipeline <- file.path('2_pipeline', NAME)
+}
+
+if (!dir.exists(pipeline)) {
+  dir.create(pipeline)
+  for (folder in c('out', 'store', 'tmp')){
+    dir.create(file.path(pipeline, folder))
+  }
+}
+
+
+
+library(tidyverse)            # data manipulation
+library(lubridate) #dates and times
+library(MuMIn) #model inference/aic
+library(vegan) #community analysis
+library(tictoc) #function times
+library(sf) ## working with spatial features
+library(MASS) ##glm.nb
+library(pscl)  ##ZIP and ZINB
+
+
+# library(magrittr) ## %$%
+select <- dplyr::select
+filter <- dplyr::filter
+
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r * 2)
+}
+panel.hist <- function(x, ...)
+{
+    usr <- par("usr")
+    par(usr = c(usr[1:2], 0, 1.5) )
+    h <- hist(x, plot = FALSE)
+    breaks <- h$breaks; nB <- length(breaks)
+    y <- h$counts; y <- y/max(y)
+    rect(breaks[-nB], 0, breaks[-1], y, col = "cyan", ...)
+}
+#source("1_code/forCorPlot.R") ##From Zuur book, for pairs plot
+options(na.action = "na.fail")
+```
+
+#Ordination
+
+Set up count matrix
+
+```{r}
+# ##summed per site
+hab.sum <- read_rds("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum_site.RDS")
+counts <- read_rds("E:/Archive/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
+#less common species already removed (must have been detected at 20% of sites)
+
+hab.sum <- filter(hab.sum, wetland.layer & siteID != "371499-B") ## only use sites with wetland layer to see if important, 371499-B had no detections and only has 1, 3min ARU recording. 
+hab.sum<-hab.sum%>%filter(siteID%in%counts$siteID)%>%filter(buffer=="500")
+
+counts <- filter(counts, siteID %in% hab.sum$siteID) ## no detections
+
+counts.m <- pivot_wider(counts, id_cols = siteID,
+                        names_from=species_code,
+                        values_from = abundance, values_fill = 0)
+all.equal(unique(hab.sum$siteID), rownames(counts.m))
+ tmp <- as.matrix(counts.m[,2:length(counts.m[1,])])
+ rownames(tmp) <- counts.m$siteID
+ counts.m <- tmp
+
+```
+
+##Combined habitat variables
+
+Environmental variables seem to fall into forest, open/shrub, and wet/wet groupings. Most basic groupings based on ordination
+
+```{r}
+
+hab.sum$h_forest <- rowSums(hab.sum[,c("h_evergreen_forest", "h_mixed_forest", "h_deciduous_forest", "h_woodland")])
+
+hab.sum$h_open <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_low", 
+                                     "h_barren", "h_herb", "h_sparce_veg", "h_tussock_tundra",
+                                     "h_burn-herb", "h_burn-shrub", "h_burn-sappling")])
+
+ord <- cca(counts.m ~ h_open + h_forest + h_wet + d_surface + wden + 
+             elev + lat + lon, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord 
+plot(ord) 
+plot(ord, display = "sp") #h_wet less important
+
+##what about nasa fens and bogs? group with open?
+ord1 <- cca(counts.m ~ h_open + h_forest +  d_surface  + h_fen_nasa +h_bog_nasa +
+             elev + lat + lon, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+plot(ord1) 
+plot(ord, display = "sp") #h_wet less important
+
+hab.sum$h_open <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_low", 
+                                     "h_barren", "h_herb", "h_sparce_veg", "h_tussock_tundra",
+                                     "h_burn-herb", "h_burn-shrub", "h_burn-sappling",
+                                     "h_fen_nasa", "h_bog_nasa")])
+
+```
+
+## forest
+
+```{r}
+ord_forest <- cca(counts.m ~ h_open +  h_wet + d_surface + wden + 
+             elev + lat + lon + h_evergreen_forest+h_mixed_forest+h_deciduous_forest+h_woodland, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_forest ## constrained inertia increased to 0.6 
+plot(ord_forest)
+
+ord_forest2 <- cca(counts.m ~  h_evergreen_forest+h_mixed_forest+h_deciduous_forest+h_woodland, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_forest2 
+plot(ord_forest2) ## woodland most different
+
+hab.sum$h_wet <- rowSums(hab.sum[,c("h_evergreen_forest", "h_mixed_forest", "h_deciduous_forest")])
+
+ord_forest3 <- cca(counts.m ~ h_open +  h_wet + d_surface + wden + 
+             elev + lat + lon + h_wet+h_woodland, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_forest3 ##  0.5464 vs 0.5663, 1 var added
+plot(ord_forest3)
+
+## but we anticipate anticipate many species to react differently to coniferous vs decidous trees?
+## is there enough to model separately?
+hab.sum150 <- hab.sum %>% filter(buffer == 150)
+table(hab.sum150$h_deciduous_forest > 0.1) #5/145## not enough to model
+table(hab.sum150$h_mixed_forest > 0.1) #12/145## not enough to model
+table(hab.sum150$h_evergreen_forest > 0.1) 
+table(hab.sum150$h_woodland > 0.1) 
+
+hab.sum$h_deciduousc <- rowSums(hab.sum[,c("h_mixed_forest", "h_deciduous_forest")])
+hab.sum150 <- hab.sum %>% filter(buffer == 150) #5/159
+table(hab.sum150$h_deciduousc > 0.1) #18/145(only 11% of sites are > 10% deciduous/mixed)
+table(hab.sum150$h_deciduousc > 0.05) #32/159
+#hist(hab.sum150$h_deciduousc)
+
+ord_forest4 <- cca(counts.m ~ h_open +  h_wet + d_surface + wden + 
+             elev + lat + lon + h_evergreen_forest + h_woodland + h_deciduousc, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_forest3 ## 0.5663
+ord_forest4 ##  0.5663 vs 0.5846, 1 var added
+plot(ord_forest4) ## no strong reason the seperate deciuous from evergreen
+
+hab.sum <- select(hab.sum, -h_mixed_forest, -h_deciduous_forest, -h_deciduousc, -h_evergreen_forest) ## used closed forest and woodland, because not enough deciduous/mixed to model separately
+```
+
+## open and burns
+
+```{r}
+ord_open <- cca(counts.m ~ h_shrub_tall+h_shrub_open+h_shrub_low+h_bog_nasa+h_fen_nasa+h_barren+h_herb+h_sparce_veg+h_tussock_tundra+ `h_burn-herb` + `h_burn-shrub` + `h_burn-sappling`+  h_wet + d_surface + wden + 
+             elev + lat + lon + h_forest, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_open ## constrained inertia increased to 0.70
+plot(ord_open) ## burns separated from shrub/open?
+
+ord_open2 <- cca(counts.m ~ h_shrub_tall+h_shrub_open+h_shrub_low+h_bog_nasa+h_fen_nasa+h_barren+h_herb+h_sparce_veg+h_tussock_tundra+ `h_burn-herb` + `h_burn-shrub` + `h_burn-sappling`, 
+           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_open2 
+plot(ord_open2)
+plot(ord_open2, display = "sp")
+
+## burn herb is coming out as distinct - try grouping all burns together to see if it improves
+hab.sum$h_burn <- rowSums(hab.sum[,c("h_burn-shrub","h_burn-herb", "h_burn-sappling")])
+filter(hab.sum, buffer == 150) %>% pull(h_burn) %>% hist ## not a great gradient
+table(filter(hab.sum, buffer == 150) %>% pull(h_burn) > 0.1) ## 18/145, 12% of sites > 10% burned
+
+hab.sum$h_open_noburn <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_low", 
+                                            "h_bog_nasa", "h_fen_nasa",
+                                     "h_barren", "h_herb", "h_sparce_veg", "h_tussock_tundra")])
+
+hab.sum <- hab.sum %>% select(-h_shrub_tall,-h_shrub_open,-h_shrub_low,-h_barren,-h_herb,-h_sparce_veg,-h_tussock_tundra,-`h_burn-herb`,-`h_burn-shrub`, -`h_burn-sappling`)
+
+ord1 <- cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface + wden + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord1 ##0.5663
+plot(ord1) #h_wet less important
+
+ord2 <- cca(counts.m ~ h_burn + h_open_noburn  + h_woodland + h_wet + h_wet + d_surface + wden + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord2 ##0.5663 vs 0.5922, 1 var added... keep the burn category
+plot(ord2) ## burn is plotting in seperate quadrant, keep seperate even though poor coverage. 
+
+
+```
+
+## wet
+
+```{r}
+ord_wet <- cca(counts.m ~ h_open + h_woodland + h_wet + h_water + d_wet +h_bog_nasa + h_fen_nasa + d_surface + wden + elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_wet 
+plot(ord_wet) 
+
+
+ord_wet2 <- cca(counts.m ~ h_water +h_bog_nasa + h_fen_nasa +d_wet + h_wet, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_wet2 
+plot(ord_wet2) 
+
+hab.sum <- hab.sum %>% select(-h_bog_nasa, -h_fen_nasa) ## grouped with open, assume if these areas are correctly identified, they will also be picked up on wetland layers. 
+
+ord2 <- cca(counts.m ~ h_open +  h_woodland + h_wet + d_surface + wden + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord2 ##0.54
+plot(ord2) #h_wet less important
+
+```
+
+## stream density
+
+```{r}
+ord_wden <- cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface + wden_1+ wden_2+ wden_3+ wden_4+ wden_5+ wden_high + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_wden 
+plot(ord_wden)
+
+ord_wden1 <- cca(counts.m ~ wden_1+ wden_2+ wden_3+ wden_4+ wden_5+ wden_high, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_wden1 
+plot(ord_wden1) ## group 1 and 2 vs 3+
+
+hab.sum$wden_high4 <- rowSums(hab.sum[,c("wden_4", "wden_5", "wden_high")])
+hab.sum$wden_high3 <- rowSums(hab.sum[,c("wden_3","wden_4", "wden_5", "wden_high")])
+hab.sum$wden_high2 <- rowSums(hab.sum[,c("wden_2","wden_3","wden_4", "wden_5", "wden_high")])
+cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface +  wden_high4 + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))##0.5496, 0 variables added
+cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface +  wden_high3 + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))##0.564, 0 variables added
+cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface +  wden_high2 + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))##0.5592, 0 variables added
+cca(counts.m ~ h_open  + h_woodland + h_wet + h_wet + d_surface +  wden + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))##0.5603, 0 variables added
+
+##high3 had highest inertia, so use this as the cut off for larger streams. Also corresponds reasonably well with the stream size that is typical for mines, hopefully a good separator for comparable riparian stream sites. 
+hab.sum$wden_high <- rowSums(hab.sum[,c("wden_3", "wden_4", "wden_5", "wden_high")])
+hab.sum <- hab.sum %>% select(-wden_1,-wden_2, -wden_3, -wden_4, -wden_5, -wden_high2, -wden_high3, -wden_high4)
+```
+
+## disturbance----
+
+```{r}
+
+ord_d <- cca(counts.m ~ h_open  + h_forest + h_wet + wden_high +
+               d_pBare + d_pVeg + d_wet + d_lden_r + d_lden_c + d_lden_t +  
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_d 
+plot(ord_d) ## all closely grouped
+
+ord_d1 <- cca(counts.m ~ d_pBare + d_pVeg + d_wet + d_lden_r + d_lden_c + d_lden_t, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_d1 
+plot(ord_d1) ## Cutlines and trails are more similar than roads
+
+## Vegetated vs unvegetated features....
+
+hab.sum$d_lden_all <- rowSums(hab.sum[,c("d_lden_r", "d_lden_t", "d_lden_c")])
+hab.sum$d_lden_nonroad <- rowSums(hab.sum[,c("d_lden_t", "d_lden_c")])
+
+table(hab.sum %>% filter(buffer == 150) %>% pull(d_wet) > .1) #5/159
+table(hab.sum %>% filter(buffer == 150) %>% pull(d_wet) > .05) #11/159
+table(hab.sum %>% filter(buffer == 150) %>% pull(d_pWater) > .05) #1/159
+table(hab.sum %>% filter(buffer == 150) %>% pull(d_wet) > 0) #45/159
+table(hab.sum %>% filter(buffer == 150) %>% pull(d_pWater) > 0) #25/159
+#hist(hab.sum %>% filter(buffer == 150) %>% pull(d_wet))
+#hist(hab.sum %>% filter(buffer == 150) %>% pull(d_pWater))
+## drop d_pWater (this is based on watermask only)
+
+ord3 <- cca(counts.m ~ h_open + h_forest + h_wet + 
+              d_pBare + d_pVeg + d_wet + d_lden_all + wden_high + 
+             elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord3 
+plot(ord3)
+
+hab.sum <- select(hab.sum, -"d_lden_t", -"d_lden_c", -'d_pWater')
+
+```
+
+## climate
+
+```{r}
+ord_clim <- cca(counts.m ~ h_open  + h_forest + h_wet + d_pBare + d_pVeg + 
+                  d_lden_all + wden_high + elev + lat + lon,
+                data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+ord_clim 
+plot(ord_clim)
+
+#plot(cca(counts.m ~ mn_june_tmax + mn_june_tmin + mn_june_precip + mn_total_precip + mn_last_snow, 
+                data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B")))
+
+
+#cor(hab.sum$mn_june_tmax, hab.sum$mn_june_tmin) #highly correlated
+#ggplot(hab.sum) + geom_histogram(aes(scale(mn_june_tmax)), alpha = .5, fill = "red") + 
+#  geom_histogram(aes(scale(mn_june_tmin)), alpha = .5, fill = "blue")
+
+#cor(hab.sum$mn_june_precip, hab.sum$mn_total_precip) # highly correlated
+#ggplot(hab.sum) + geom_histogram(aes(scale(mn_june_precip)), alpha = .5, fill = "red") + 
+#  geom_histogram(aes(scale(mn_total_precip)), alpha = .5, fill = "blue")
+
+#cor(hab.sum$mn_last_snow, hab.sum$mn_total_precip) 
+#cor(hab.sum$mn_last_snow, hab.sum$mn_june_tmax) 
+
+#cor(hab.sum$elev, hab.sum$mn_june_tmax) 
+#ggplot(hab.sum, aes(elev, mn_june_tmax)) + geom_point() + geom_smooth()
+#ggplot(hab.sum, aes(elev, mn_june_tmin)) + geom_point() + geom_smooth()
+
+#hab.sum <- select(hab.sum, -mn_june_tmax, -mn_total_precip, -mn_june_precip, -mn_last_snow) 
+## min temp is likely best predicted and most ecological sense
+## Precipitation is also likely important, but I've doubts about the data quality at the scale we're working on. 
+
+```
+
+#covariate summaries
+
+```{r}
+##### check it can all be modelled
+
+hab.sum$year <- as.factor(hab.sum$year)
+hab.sum$siteID <- as.factor(hab.sum$siteID)
+hab.sum$organization <- as.factor(hab.sum$organization)
+#hab.sum <- select(hab.sum, -"EPSG")
+
+summary(hab.sum %>% filter(buffer == 150))
+
+hab.sum150 <- hab.sum %>% filter(buffer == 150)
+hab.sum1000 <- hab.sum %>% filter(buffer == 1000)
+
+n.sites <- length(unique(hab.sum150$siteID))
+table(hab.sum150$h_forest_closed > 0)/n.sites
+mean(hab.sum150$h_forest_closed)
+sd(hab.sum150$h_forest_closed)
+quantile(hab.sum150$h_forest_closed, c(.1, .9))
+
+table(hab.sum150$h_woodland > 0)/n.sites
+mean(hab.sum150$h_woodland)
+sd(hab.sum150$h_woodland)
+quantile(hab.sum150$h_woodland, c(.1, .9))
+
+table(hab.sum150$h_burn > 0)/n.sites
+mean(hab.sum150$h_burn)
+sd(hab.sum150$h_burn)
+quantile(hab.sum150$h_burn, c(.1, .9))
+
+table(hab.sum150$h_open_noburn > 0)/n.sites
+mean(hab.sum150$h_open_noburn)
+sd(hab.sum150$h_open_noburn)
+quantile(hab.sum150$h_open_noburn, c(.1, .9))
+
+table(hab.sum150$h_water > 0)/n.sites
+hab.sum <- select(hab.sum, -h_water) ## very low prevelance, so remove
+
+table(hab.sum150$h_wet > 0)/n.sites
+mean(hab.sum150$h_wet)
+sd(hab.sum150$h_wet)
+quantile(hab.sum150$h_wet, c(.1, .9))
+
+table(hab.sum150$d_pBare > 0)/n.sites
+mean(hab.sum150$d_pBare)
+sd(hab.sum150$d_pBare)
+quantile(hab.sum150$d_pBare, c(.1, .9))
+
+table(hab.sum150$d_pVeg > 0)/n.sites
+mean(hab.sum150$d_pVeg)
+sd(hab.sum150$d_pVeg)
+quantile(hab.sum150$d_pVeg, c(.1, .9))
+
+table(hab.sum150$d_wet > 0)/n.sites
+mean(hab.sum150$d_wet)
+sd(hab.sum150$d_wet)
+quantile(hab.sum150$d_wet, c(.1, .9))
+
+table(hab.sum150$d_lden_r > 0)/n.sites
+mean(hab.sum150$d_lden_r*1000)
+sd(hab.sum150$d_lden_r*1000)
+quantile(hab.sum150$d_lden_r*1000, c(.1, .9))
+
+table(hab.sum150$d_lden_nonroad > 0)/n.sites
+mean(hab.sum150$d_lden_nonroad*1000)
+sd(hab.sum150$d_lden_nonroad*1000)
+quantile(hab.sum150$d_lden_nonroad*1000, c(.1, .9))
+
+table(hab.sum150$wden_high > 0)/n.sites
+mean(hab.sum150$wden_high*1000)
+sd(hab.sum150$wden_high*1000)
+quantile(hab.sum150$wden_high*1000, c(.1, .9))
+
+table(hab.sum150$wden > 0)/n.sites
+mean(hab.sum150$wden*1000)
+sd(hab.sum150$wden*1000)
+quantile(hab.sum150$wden*1000, c(.1, .9))
+
+mean(hab.sum150$mn_june_tmin)
+sd(hab.sum150$mn_june_tmin)
+quantile(hab.sum150$mn_june_tmin, c(.1, .9))
+
+mean(hab.sum150$elev)
+sd(hab.sum150$elev)
+quantile(hab.sum150$elev, c(.1, .9))
+
+mean(hab.sum150$lat_wgs84)
+sd(hab.sum150$lat_wgs84)
+quantile(hab.sum150$lat_wgs84, c(.1, .9))
+
+mean(hab.sum150$lon_wgs84)
+sd(hab.sum150$lon_wgs84)
+quantile(hab.sum150$lon_wgs84, c(.1, .9))
+
+## buffer = 1000 ----
+n.sites <- length(unique(hab.sum1000$siteID))
+table(hab.sum1000$h_forest_closed > 0)/n.sites
+mean(hab.sum1000$h_forest_closed)
+sd(hab.sum1000$h_forest_closed)
+quantile(hab.sum1000$h_forest_closed, c(.1, .9))
+
+table(hab.sum1000$h_woodland > 0)/n.sites
+mean(hab.sum1000$h_woodland)
+sd(hab.sum1000$h_woodland)
+quantile(hab.sum1000$h_woodland, c(.1, .9))
+
+table(hab.sum1000$h_burn > 0)/n.sites
+mean(hab.sum1000$h_burn)
+sd(hab.sum1000$h_burn)
+quantile(hab.sum1000$h_burn, c(.1, .9))
+
+table(hab.sum1000$h_open_noburn > 0)/n.sites
+mean(hab.sum1000$h_open_noburn)
+sd(hab.sum1000$h_open_noburn)
+quantile(hab.sum1000$h_open_noburn, c(.1, .9))
+
+table(hab.sum1000$h_wet > 0)/n.sites
+mean(hab.sum1000$h_wet)
+sd(hab.sum1000$h_wet)
+quantile(hab.sum1000$h_wet, c(.1, .9))
+
+table(hab.sum1000$d_pBare > 0)/n.sites
+mean(hab.sum1000$d_pBare)
+sd(hab.sum1000$d_pBare)
+quantile(hab.sum1000$d_pBare, c(.1, .9))
+
+table(hab.sum1000$d_pVeg > 0)/n.sites
+mean(hab.sum1000$d_pVeg)
+sd(hab.sum1000$d_pVeg)
+quantile(hab.sum1000$d_pVeg, c(.1, .9))
+
+table(hab.sum1000$d_wet > 0)/n.sites
+mean(hab.sum1000$d_wet)
+sd(hab.sum1000$d_wet)
+quantile(hab.sum1000$d_wet, c(.1, .9))
+
+
+table(hab.sum1000$d_lden_r > 0)/n.sites
+mean(hab.sum1000$d_lden_r*1000)
+sd(hab.sum1000$d_lden_r*1000)
+quantile(hab.sum1000$d_lden_r*1000, c(.1, .9))
+
+table(hab.sum1000$d_lden_nonroad > 0)/n.sites
+mean(hab.sum1000$d_lden_nonroad*1000)
+sd(hab.sum1000$d_lden_nonroad*1000)
+quantile(hab.sum1000$d_lden_nonroad*1000, c(.1, .9))
+
+table(hab.sum1000$wden_high > 0)/n.sites
+mean(hab.sum1000$wden_high*1000)
+sd(hab.sum1000$wden_high*1000)
+quantile(hab.sum1000$wden_high*1000, c(.1, .9))
+
+table(hab.sum1000$wden > 0)/n.sites
+mean(hab.sum1000$wden*1000)
+sd(hab.sum1000$wden*1000)
+quantile(hab.sum1000$wden*1000, c(.1, .9))
+
+```
+
+#primary habitat
+
+```{r}
+##Primary habitat types ----
+hab.vars <- c("h_wet","h_woodland", 
+              "h_burn", "d_surface", "h_wet")
+
+##finds habitat types that covers the highest proportion
+hab.sum$habclass <- apply(hab.sum[, hab.vars], 1, function(x){
+  sub('..','', names(x)[x==max(x)]) ##sub: match first 3 characters, replace with nothing
+  })
+sort(table(hab.sum$habclass)) ##only 2 primarily disturbed sites
+ggplot(hab.sum, aes(habclass)) + geom_bar() + ylab('Number of Sites') + xlab("Habitat Class")
+
+hab.sum <- ungroup(hab.sum) %>% filter(wetland.layer)
+```
+
+#covariate correlation
+
+> date/time/sound transmission/number of sites, and number of visits are accounted for in offsets.
+
+```{r}
+pairs(hab.sum %>% filter(buffer == 1000) %>% ungroup() %>% 
+        select("AllDisturbance\n Area" = "d_surface", "BareDisturbance\n Area" = "d_pBare", "VegDisturbance\n Area" = "d_pVeg", 
+               "Roads\n density" = "d_lden_r", "NonRoad\n density" = "d_lden_nonroad", 
+               "AllLinear\n density" = "d_lden_all"),
+      upper.panel=panel.smooth,
+      diag.panel = panel.hist,
+      lower.panel=panel.cor, cex.labels=1.5, 
+      main = "1000m buffer")
+
+pairs(hab.sum %>% filter(buffer == 150) %>% ungroup() %>% 
+        select("AllDisturbance\n Area" = "d_surface", "BareDisturbance\n Area" = "d_pBare", "VegDisturbance\n Area" = "d_pVeg", 
+               "Roads\n density" = "d_lden_r", "NonRoad\n density" = "d_lden_nonroad", 
+               "AllLinear\n density" = "d_lden_all"),
+      upper.panel=panel.smooth,
+      diag.panel = panel.hist,
+      lower.panel=panel.cor, cex.labels=1.5, 
+      main = "150m buffer")
+
+#Disturbance variables are highly colinear, will have to model surface disturbance and linear density seperately, or use a different metric for linear disturbances (e.g. convert to area and remove from surface disturbance, effective mesh size or another metric of fragmentation, distance to nearest road feature)
+
+
+
+pairs(hab.sum %>% filter(buffer == 1000) %>% select(d_surface, d_lden_all, h_forest, h_open, h_wet,  wden, mn_june_tmin,  elev, lat, lon),
+      upper.panel=panel.smooth,
+      diag.panel = panel.hist,
+      lower.panel=panel.cor, cex.labels=1.5) ## forest and open are also highly correlated, and surface vs linear disturbance are correlated at larger scale. 
+
+```
+
+# landscape scale selection:
+
+Currently we have 5 potential spatial scales for each variable - which is most relevant for each species?
+
+For the multifit model, offset, %ARU, noise.sqrt, and year are included in all models to account for variation in detectability. If those models don't converge, I then tried a simpler model with just the offset.
+
+I'm using a negative binomial model distribtion (can reduce to poisson, simpler than ZI models)
+
+### multifit ----
+
+"We tested the effect of the landscape metrics on the response variables using the multifit function proposed by Huais (2018) for multi-scale analyzes. We used linear models to identify the landscape size most appropriate (i.e., with highest R2 and lowest P-value) to analyze the effect of each landscape variable on response variables. In the after statistical analyses, we used the best-scale of each landscape predictor evidenced in Table A1.
+
+Appendix of `Landscape composition is more important than local vegetation structure for understory birds in cocoa agroforestry systems`, Júlia Perez Cabrala, Deborah Fariaa and José Carlos Morante-Filhoa
+
+```{r}
+### Reload, some filtering used for cca doesn't apply
+counts <- read_rds("E:/Archive/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
+counts <- filter(counts, siteID %in% hab.sum$siteID) ## no detections
+scaled.vars <- hab.sum %>% select(starts_with("h_"), starts_with("d_"), starts_with("wden")) %>% colnames()
+## for species detected at between 10 - 25% of sites, could try P/A models
+
+counts.spec <- split(counts, counts$species_code)
+
+tmp <- sapply(counts.spec, function(x) {
+  sum(x$abundance > 0)
+}) 
+n.sites <- length(unique(hab.sum$siteID))
+tmp[tmp<.20*n.sites] ## will loose all the SAR species. 
+tmp[tmp> .75*n.sites] ##require birds to be detected at <80% of sites? For abundance, highend shouldn't matter 
+counts.spec <- counts.spec[tmp>.2*n.sites] ##require species to be detected at > 20% of sites (29) 
+
+counts.spec <- lapply(counts.spec, function(x) inner_join(x, hab.sum %>% filter(wetland.layer & siteID != "371499-B")))
+
+source("E:/Archive/1_code/multifit.R") ##https://doi.org/10.1007/s10980-018-0657-5;  https://github.com/phuais/multifit/blob/master/multifit.R,
+var.sel <- data.frame(variable = NULL, buffer = NULL)
+counts.l <- list()
+for(x in 1:length(counts.spec)){
+
+  spec <- counts.spec[[x]]
+  spec.l <- list() ## df of covariates at 'best' scale as determined by AIC of single covariate nb models
+  var.sel.x <- data.frame(variable = NULL, buffer = NULL)
+  for(i in 1:length(scaled.vars)){
+    var.i <-scaled.vars[i]
+    tmp <- spec %>% pivot_wider(id_cols = c(organization, siteID, year, offset,
+                                     abundance, perARU, noise.sq),
+                         names_from = buffer,
+                         names_glue = "{var.i}_{buffer}", values_from = var.i)
+
+  fits <- tryCatch(multifit(mod = "glm.nb",
+       multief = colnames(tmp)[8:length(colnames(tmp))],
+       formula = abundance ~ multief + perARU + noise.sq + year + offset(offset),
+       data = tmp, criterion = "AIC", ylab = "AIC",
+       xlab = "buffer (m)",
+       plot_est = TRUE), error = function(e) NULL)
+
+    if(is.null(fits)) {
+      fits <- tryCatch(multifit(mod = "glm.nb",
+                     multief = colnames(tmp)[8:length(colnames(tmp))],
+                     formula = abundance ~ multief + offset(offset),
+                     data = tmp, criterion = "AIC", ylab = "AIC", xlab = "buffer (m)",
+                     plot_est = TRUE), error = function(e) NULL)
+          }
+
+      if(is.null(fits$summary)) {next}
+
+      best_scale <- fits$summary %>% filter(AIC == min(AIC)) %>% pull(multief)
+      spec.l[[length(spec.l)+1]] <- tmp %>% select(siteID, year, "{var.i}" := any_of(best_scale))
+
+      var.sel.x[length(var.sel.x$variable)+1,c("variable", "buffer")] <- 
+        cbind(var.i, parse_number(as.character(best_scale)))
+      print(i)
+
+  }
+
+  if(length(spec.l)<1) {next}
+  spec.df <- reduce(spec.l, left_join)
+
+  spec.df <- spec %>% select(-all_of(scaled.vars),  -buffer, - habclass) %>% distinct() %>%
+    left_join(spec.df)
+
+  var.sel.x$species_code <- unique(spec.df$species_code)
+
+  counts.l[[x]] <- spec.df
+  var.sel <- rbind(var.sel, var.sel.x)
+  print(x)
+}
+
+names(counts.l) <- names(counts.spec)
+counts.l <- counts.l[!sapply(counts.l, is.null)] ## no TOSO models converged
+par(mfrow = c(1,1))
+
+saveRDS(counts.l, file.path(pipeline, "store", "counts_scaled.rds"))
+saveRDS(var.sel, file.path(pipeline, "store", "selected_scales.rds"))
+
+```
+
+Both low and high buffers are being selected. Check how correlated these are, will it matter? Would be cleaner if we could focus on just 2 scales.
+
+```{r}
+counts.l <- readRDS(file.path("E:/Archive",pipeline, "store", "counts_scaled.rds"))
+var.sel <- readRDS(file.path("E:/Archive",pipeline, "store", "selected_scales.rds"))
+
+var.sel$buffer <- as.numeric(var.sel$buffer)
+table(var.sel$buffer)
+table(var.sel$species_code, var.sel$buffer)
+
+var.sel <- mutate(var.sel, buff.class = ifelse(buffer < 300, "low", ifelse(buffer > 500, "high", "med")))
+
+table(var.sel$buff.class)
+table(var.sel$species_code, var.sel$buff.class) 
+
+###  'best' buffer tends to be either 150 or 1000.  
+## Could either select the best scale per variable, i.e. counts_scaled, OR bring both 150 and 1000m scales forward for each variable and eliminate through model selection. 
+
+hab.sum %>% select(-habclass) %>% pivot_longer(cols = c(starts_with("h_"), starts_with("d_"), starts_with("wden")), names_to = "variable", values_to = "cover") %>% 
+  pivot_wider(names_from = buffer, names_prefix = "b", values_from = cover) %>% group_by(variable) %>% 
+  summarise(cor_loc = cor(b150,), cor_loc_med = cor(b150, b500), cor_med_land = cor(b500, b1000), 
+            cor_land_land = cor(b750, b1000), cor_loc_land = cor(b150, b1000))
+## Correlations between adjacent buffers are really high, so likely will only make minor difference. Keep just 150m and 1000m buffers
+
+hab.sum <- filter(hab.sum, buffer %in% c(150, 1000)) 
+counts.spec <- lapply(counts.spec, function(x) filter(x, buffer %in% c(150,1000)))
+```
+
+#Select model error distribution (poisson, nb, ZIP or ZINB)
+
+Will use the multifit selected buffers to simplify models. Here, for each species, we compare the AIC of poisson, nb, ZIP and ZINB to get an idea of which error distribution we should be using. The covariates I'm using are elevation, h_open, h_wet, d_surface, year, perARU, noise.sqrt with the offset. I didn't include forest because h_open + h_forest + d_surface adds to 1 (so redundant, dropping the most ubiquitous variable).
+
+for ZI models, the prob of detecting if present doesn't relate to any variables, could add perARU or noise to that side of the equation.
+
+If the model doesn't converge, NA is returned and the model AIC isn't compared for that error distribution.
+
+```{r}
+spec.v <- sapply(counts.l, FUN = function(x) unique(x$species_code))
+names(counts.l) <- spec.v
+
+MP <- sapply(counts.l, function(df){
+
+tryCatch({
+
+##poisson
+AIC(glm(abundance ~ elev +  h_open + h_wet  + d_surface +
+               year + perARU + noise.sq,
+          data=df, family=poisson, offset=offset))
+},
+error = function(cond){
+  message(cond)
+  return(NA)
+},
+warning = function(cond){
+  message(cond)
+  return(NA)
+})
+})
+
+MNB <- sapply(counts.l, function(df){
+
+tryCatch({
+
+  ##poisson
+  AIC(glm.nb(abundance ~ elev +  h_open + h_wet  + d_surface +
+               year + perARU + noise.sq + offset(offset), data = df))
+},
+error = function(cond){
+  message(cond)
+  return(NA)
+},
+warning = function(cond){
+  message(cond)
+  return(NA)
+})
+})
+
+MZIP <- sapply(counts.l, function(df){
+
+  tryCatch({
+
+    ##ZIP
+    AIC(zeroinfl(abundance ~ elev +  h_open + h_wet  + d_surface +
+               year + perARU + noise.sq | 1,
+                 data = df, dist = "poisson", offset = offset))
+  },
+  error = function(cond){
+    message(cond)
+    return(NA)
+  },
+  warning = function(cond){
+    message(cond)
+    return(NA)
+  })
+})
+
+MZINB <- sapply(counts.l, function(df){
+
+  tryCatch({
+
+    ##ZINB
+        AIC(zeroinfl(abundance ~ elev +  h_open + h_wet  + d_surface +
+               year + perARU + noise.sq | 1,
+                 data = df, dist = "negbin", offset = offset))
+  },
+  error = function(cond){
+    message(cond)
+    return(NA)
+  },
+  warning = function(cond){
+    message(cond)
+    return(NA)
+  })
+})
+
+
+pd <- data.frame(MP, MNB, MZIP, MZINB)
+pd <- names(pd)[(apply(pd, 1, function(x) which(x == min(x, na.rm = T))))]
+table(pd)  ### best models is almost always negbin. The only ZIP/ZINB selected were for species that negbin didn't converge for.  I would recommend proceedings with negbin for all species, excluding models with errors from AIC comparison.  It could be that simpler models will converge for these species.
+pd <- as.list(pd)
+names(pd) <- names(counts.l)
+
+```
+
+best models is almost always negbin. The only ZIP/ZINB selected were for species that negbin didn't converge for. I would recommend proceedings with negbin for all species, excluding models with errors from AIC comparison. It could be that simpler models will converge for these species.
+
+# Save simplified counts and hab.sum for modeling
+
+```{r}
+saveRDS(counts.spec, file.path("E:/Archive",pipeline, "store", "counts_simp.RDS"))
+saveRDS(hab.sum, file.path("E:/Archive",pipeline, "store", "hab.sum_simp.RDS"))
+
+```

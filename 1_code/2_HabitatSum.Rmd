@@ -1,0 +1,2033 @@
+---
+title: "2_HabitatSum"
+author: "Morgan Brown & Austin Zeller"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script summarises environmental variables around each site and
+survey station. It imports station coordinates from
+1_CountDataProcessing, and imports several datafiles from 0_data/GIS
+
+#setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning = FALSE)
+
+NAME <- '2_HabitatSum' ## Name of the R file goes here (without the file extension!)
+PROJECT <- 'Archive' ## Project folder
+# PROJECT_DIR <- 'C:/Users/jbrown1/surfdrive/WCSC' ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes (i.e. 
+PROJECT_DIR <- "E:/Archive"
+
+gis_dir <- "E:/Archive/0_data/GIS"
+##Set working directory
+# setwd(file.path(PROJECT_DIR, PROJECT))
+# knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
+# Set  up pipeline folder if missing
+### The code below will automatically create a pipeline folder for this code file if it does not exist.
+
+if (dir.exists(file.path('empirical', '2_pipeline'))){
+  pipeline <- file.path('empirical', '2_pipeline', NAME)
+} else {
+  pipeline <- file.path('2_pipeline', NAME)
+}
+
+if (!dir.exists(pipeline)) {
+  dir.create(pipeline)
+  for (folder in c('out', 'store', 'tmp')){
+    dir.create(file.path(pipeline, folder))
+  }
+}
+
+
+# Load Packages ----
+library(tidyverse)
+library(lubridate)
+library(sf) ##spatial features
+library(readxl)
+library(biscale)
+#library(rgdal) ##to read gdbs
+library(terra)
+library(tidyterra)
+library(cowplot)
+library(ggbreak)
+library(wildrtrax)
+library(tictoc)
+library(climatenaR)
+select <- dplyr::select
+theme_set(theme_classic())
+
+getmode <- function(v) {
+   uniqv <- unique(v[!is.na(v)])
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+round.nearest <- function(value, nearest) {
+  round(value/nearest) * nearest
+}
+
+
+```
+
+Load station/site coordinates
+
+```{r load data}
+crs = "EPSG:3579" # "NAD83 / Yukon Albers"
+
+## Load sites files compiled from both ARU and PC data, from ECCC and WCS
+sites <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/sites.RDS") ##actually stations...
+
+sites <- sites %>% select(org = organization, siteID, 
+                          station, year) %>% mutate(stationID = paste(siteID, station, sep = "-"))
+```
+
+#Preliminary site selection \## Identify sites without disturbance
+buffers In 2021, the YG human footprint layer was out of date, so
+disturbance data were digitized within a 1.5k buffer of the centroid
+around each site. Some sites seem to have been missing from from this
+initial selection. Almost all are ECCC ARU sites, (though another 50
+ECCC ARU sites do have disturbance data). SB010 (also missing recording
+data) also doesn't have disturbance buffers. Clara digitized
+disturbances for all 2023 sites, within a 1750m buffer of each survey
+station, so none need to be removed.
+
+An update to the YG human footprint layer came out May 2022 which
+included most of the Dawson region. It includes an area extent showing
+where disturbance had been updated based on hi-res imagery. Not all of
+our sites are within these areas. For now, identify which sites are
+included in the May 2022 update, and which sites were included in Pat's
+work. Sites with both should be compared to see which layer might be
+more reliable (currently preference towards official YG layer as it will
+eventually by published). We will do separate disturbance summaries for
+sites and then choose which to prioritise before the final land use and
+linear summaries.
+
+```{r missing disturbace}
+
+## buffers used to clip disturbance areas by Pat
+d.buff2021 <- st_read("E:/Archive/0_data/sites2021_center.shp")
+d.buffHist <- st_read("E:/Archive/0_data/historical_sites_centre.shp")
+d.siteH <- d.buffHist$loc_name
+d.siteH <- substr(d.siteH, 1, nchar(d.siteH)-1)
+d.site <- c(d.buff2021$Id, d.siteH)
+
+## Sites not covered in May 2022 YG update
+YG_extent <- st_read(file.path(gis_dir, "YG_SurfaceDisturbance_May2022/Surface_Disturbance_Mapping_Extent.shp"))
+YG_extent <- filter(YG_extent, PROJ_YEAR > 2016) %>% st_union()## 2017 is start year of surveys, so use updates from that year onwards
+sites <- sites %>%
+  mutate(org = str_replace(org, "WCSC", "WCS"))
+ggplot(data = sites) + geom_sf(data = YG_extent, alpha = .5) + geom_sf(aes(col = org)) +
+  ylim(800000, 1206089) + xlim(59945.54, 456776.7)  + 
+  coord_sf(datum = NULL) 
+
+sites$YG_update <- st_intersects(st_transform(sites, crs = st_crs(YG_extent)), YG_extent, sparse = F)[,1]
+
+## Sites missing from Pat's Layer
+## 52 sites are missing buffers. 
+sites <- sites %>% mutate(dbuff = siteID %in% d.site| year == 2023)
+
+
+ggplot(sites, aes(col = dbuff | YG_update)) + geom_sf()
+
+
+```
+
+## Bioclimate zones and subzones
+
+From GeoYukon. Boreal low, boreal high, boreal subalpine, subartic
+woodland, subartic subalpine. Boreal low is seperated into subzones
+(e.g. yukon plateau central, yukon plateau north, laird-hyland, ruby
+ranges) Sites can overlap multiple zones. I think priority should be
+given to identifying boreal low, where I suspect there will be higher
+bird diversity. These areas are also where placer mines tend to be
+(though there are also mine sites in boreal high zones). For now,
+calculate % cover as done for habitat raster, and if not too correlated,
+% cover values from both can be used. Also easier to adjust to a
+categorical if already have %cover (e.g. if % cover boreal low \> 0,
+'boreal low')
+
+```{r Bioclimate zones}
+biozone <-  rast(file.path(gis_dir, "Bioclimate_zones_and_subzones/Bioclimate_zones_and_Subzones.tif")) #load raster
+cats(biozone)
+biozone_cat <- read_csv(file.path(gis_dir, "Bioclimate_zones_and_subzones/Bioclimate_zones_and_Subzone_YA_Att.csv"))
+
+biozone_cat <- biozone_cat %>% mutate(SUBZONE = ifelse(is.na(SUBZONE), ZONE, SUBZONE)) %>% select(-OID_)
+biozone_cat <- biozone_cat %>% mutate(zone = str_replace_all(ZONE, " ", "_"))
+
+activeCat(biozone) <- 2 ##switch to biozone, not label
+# plot(biozone)
+
+biozone.l <- sites %>% 
+  st_buffer(dist = 150) %>%
+  st_transform(crs = crs(biozone)) %>%
+  split(f = .$siteID) %>%
+  map(\(site) crop(x = biozone, y = site, mask=T, touches = F))
+
+biozone <- sites %>% 
+  st_buffer(dist = 150) %>%
+  st_transform(crs = crs(biozone)) %>%
+  crop(x = biozone, y = ., mask=T, touches = F)
+
+## Percent cover of different biozones. boreal_low tends to be surrounded by boreal_high, so using a categorical classification will classify most sites as boreal high... might be better to use % cover of boreal low and/or boreal subalpine 
+
+bz_sum <- map(biozone.l, function(x){
+  df <- as.data.frame(x) %>% rename(zone = ZONE)
+  df <- df %>% group_by(zone) %>% 
+    summarise(n = n()) %>% mutate(prop = n/sum(n))
+  df %>% select(-n) %>% 
+    pivot_wider(names_from = zone, names_prefix = "P.", values_from = prop)
+})
+bz_sum <- bind_rows(bz_sum, .id = "siteID")  %>%
+  complete(siteID = names(bz_sum))
+bz_sum[is.na(bz_sum)] <- 0
+
+names(bz_sum) <- str_replace_all(names(bz_sum), " ", "_")
+
+
+##classify a site based on the biozone that covers the highest proportion
+bz_sum <- bz_sum %>% 
+  mutate(ecozone = names(.[,-1])[max.col(.[,-1], 'first')]) %>%
+  mutate(ecozone = str_replace(ecozone, 'P.', ""))
+
+bioclim.vars <- c("P.Boreal_Low", "P.Boreal_High", "P.Boreal_Subalpine", "P.Boreal_Alpine_Tundra", "P.Subarctic_Woodland", "P.Subarctic_Alpine_Tundra",    "P.Subarctic_Subalpine")
+
+bz_sum$ecozone <- ordered(bz_sum$ecozone, levels = str_replace(bioclim.vars, 'P.', ''))
+
+```
+
+## EcoRegion
+
+The sites fall primarily within two different ecoregions.
+
+```{r}
+##ecoregion ----
+fgdb <- file.path(gis_dir, "Ecoregions_2014_1M.gdb")
+# ogrListLayers(fgdb)
+
+ecor <- st_as_sf(vect(fgdb, layer="Ecoregions_2014_1M"))
+ecor <- sites %>% group_by(siteID) %>% summarise() %>% st_centroid() %>% st_transform(crs = st_crs(ecor)) %>%
+  st_intersection(ecor, .) %>% mutate(ecoregion=ECOREGION)%>%select(siteID,ecoregion)
+table(ecor$ecoregion) 
+
+ecor <- left_join(ecor, bz_sum)
+
+```
+
+## remove ecoregion/ecozone outliers
+
+This is to reduce spatial and altitudinal outliers that have low
+representation in the dataset and likely have different avian
+communities that will skew the data.
+
+This is done now to reduce processing time for disturbance data.
+
+```{r}
+## Only relevent ecoregions
+table(ecor$ecoregion) ## mostly Klondike Plateau and McQuesten Highlands
+ecor %>% ggplot(aes(col = ecoregion)) + geom_sf() #, Yukon Plateau-North also is likely within range and similar enough to be relevant. 
+##Remove ecoregions accept Klondike Plateau, McQuesten Highlands and Yukon Plateau-North
+bad.ecor <- filter(ecor, !(ecoregion %in% c("Klondike Plateau", "McQuesten Highlands", "Yukon Plateau-North"))) %>% pull(siteID)
+
+sites <- filter(sites, !(siteID %in% bad.ecor))
+
+## Only relevent Biozones
+ecor %>% ggplot(aes(col = ecozone)) + geom_sf()
+table(ecor$ecozone) ## mostly boreal low or high
+##remove boreal alpine, subarctic woodland, subarctic alpine, and subarctic alpine sites
+bad.bz <- bz_sum %>% filter(ecozone %in% c("Boreal_Alpine_Tundra", "Subarctic_Woodland", "Subarctic_Alpine_Tundra", "Subarctic_Subalpine")) %>% pull(siteID)
+
+sites <- sites %>% filter(!(siteID %in% c(bad.bz)))
+ecor <- ecor %>% filter(!(siteID %in% c(bad.bz, bad.ecor)))
+
+
+
+```
+
+#Wetlands The land classification doesn't do a very good job of
+detecting wetlands (only classifies bogs and fens, and fens with poor
+accuracy). DUC has put together a wetland inventory for the Dawson
+planning region, while YG has made one for Mayo and Beaver River (only
+overlaps one site). Unfortunately they've used different methods so
+might not be very comparable. Best practice would probably resample them
+someone so they are more uniform, but I don't actually know how to do
+this. Some sites around Stewart crossing are not covered by these maps
+and will likely have to be dropped from analysis. \#### DUC wetland
+Inventory (Dawson) This document details the remote sensing-based
+wetland classification of the Dawson planning region (\~48,500 km2).
+This wetland inventory project identified the spatial extent of wetlands
+and classified them based on the five major classes of the Canadian
+Wetland Classification System (CWCS; bog, fen, swamp, marsh, and open
+water) using satellite imagery and collected field data. Remotely sensed
+datasets were acquired and processed, and included Sentinel-2,
+Sentinel-1, and ALOS PALSAR imagery, as well as the ArcticDEM Digital
+Elevation Model (DEM) and a territorial DEM. Spatially referenced field
+site information was collected via ground surveys and overhead
+helicopter data collection. Additional field site photos were collected
+from fixed-wing flights across the study area. The final mapped product
+identified 5,638 km2 of wetlands in the Dawson project area (11.7%
+aerial coverage), with an accuracy of 83.8% at the wetland level (i.e.
+wetland vs. upland vs. water) and 73.1% at the class level (i.e. open
+water, bog, fen, marsh, swamp, upland conifer, upland deciduous, upland
+barren, upland other). Swamps were the most predominant wetland class in
+the project area (5.7%), followed by fens (5.5%), bogs (0.4%), and
+marshes (\<0.1%). Open water, shallow and deep, constituted 1.1% of the
+project area.
+
+```{r wetlands}
+DUC_wet <- rast(file.path(gis_dir, "/DUCWetlandInv/Duc Dawson Wetland Inventory_Phase_02/DUC_Dawson_Phase_02_Classification/DUC_DawsonP2L2.tif")) ##raster extracted from .gbd using ArcGIS without any further alterations. 
+
+##clip within a 1500m buffer around each station and convert to sf polygon ----
+tictoc::tic()
+DUC_wet_sf <- sites %>% 
+  st_buffer(dist = 1500) %>%
+  st_transform(crs = crs(DUC_wet)) %>%
+  crop(x = DUC_wet, y = ., mask=T, touches = F) %>%
+  as.polygons(.) %>%
+  st_as_sf()
+tictoc::toc()
+
+##get extent ----
+DUC_wet_ext <- DUC_wet > 0 ##extent of raster
+DUC_wet_ext <- as.polygons(DUC_wet_ext)
+DUC_wet_ext <- st_as_sf(DUC_wet_ext)
+DUC_wet_ext <- filter(DUC_wet_ext, Class_Name == 1)
+
+
+## Keep only wetland polygons ----
+# DUC_wet_unk <-  DUC_wet_sf %>% filter(Class_Name %in% c("Cloud", "Shadow", "NoData")) ## wetlands not mapped here because of missing data, clouds or shadows.  Use other layers if available?
+DUC_wet_sf <- DUC_wet_sf %>% filter(Class_Name %in% c("Open Water", "Fen", "Bog", "Swamp")) ## DUC wetland polygons
+
+try(rm(DUC_wet))
+```
+
+#### YG wetland inventory (Mayo)
+
+This was shared to me by Nadelle Flynn, before any validation had been
+done, so I'm not sure of the predictive accuracy.
+
+```{r mayo wetland}
+# Mayo_wet <- rast(file.path(gis_dir, "MayoWetlandClassification/MayoMcQuesten_L2Wetlands_Mar2022.tif"))
+Mayo_wet <- read_sf(file.path(gis_dir, "MayoWetlandClassification/MayoMcQuesten_L2Wetlands_Mar2022.shp")) 
+
+##clip and convert to polygon ----
+tictoc::tic()
+Mayo_wet_sf <- sites %>% 
+  st_buffer(dist = 1500) %>%
+  st_transform(crs = crs(Mayo_wet)) %>%
+  st_intersection(Mayo_wet) %>%
+  rename(Class_Name = Class) %>%
+  group_by(Class_Name) %>% summarise()
+tictoc::toc()
+
+rm(Mayo_wet)
+
+```
+
+#### Beaver River wetland Map
+
+10 m resolution. separation of wetland from upland was very good, but
+separation among bog, fen and marsh was mediocre (producer accuracy 64 -
+71%, User acc 70-84%)
+
+Raster Value Classification 1 Bog 2 Exposed Fluvial 3 Fen 4 Marsh 5
+Swamp 6 River 7 Lake 8 Shallow water /Isolated Pond
+
+```{r BR wetlands}
+BR_wet <- rast(file.path(gis_dir, "BeaverRiver_WetlandMap/BRLUP_PEM_Wetland_V1.tif")) 
+
+BR_wet_ext <- BR_wet %>% as.polygons(.) %>% st_as_sf() 
+BR_wet_ext <- BR_wet_ext %>% filter(BRLUP_PEM_Wetland_V1 != 128) %>% st_union %>% st_convex_hull()
+
+
+
+##clip and convert to polygon ----
+tictoc::tic()
+BR_wet_sf <- sites %>% 
+  st_buffer(dist = 1500) %>%
+  st_transform(crs = crs(BR_wet)) %>%
+  crop(x = BR_wet, y = ., mask=T, touches = F) %>%
+  as.polygons(.) %>%
+  st_as_sf()
+tictoc::toc()
+
+## Keep only wetland polygons ----
+BR_wet_sf  <-  BR_wet_sf %>% left_join(data.frame(BRLUP_PEM_Wetland_V1 = c(1,2, 3,4,5,6,7,8, 128), Class = c("Bog", "Exposed Fluvial", "Fen", "Marsh", "Swamp", "River", "Lake", "Shallow Water", "Other")))
+
+BR_wet_sf <- BR_wet_sf %>% rename(Class_Name = Class) %>%
+  filter(!Class_Name %in% c("Other")) 
+
+rm(BR_wet)
+
+```
+
+#### Wetland poly layer
+
+Combine the three wetland maps into a single layer
+
+```{r}
+## reclassify so wetland classes are the same
+DUC_wet_sf <- DUC_wet_sf %>% select(class = Class_Name) %>% 
+  mutate(class = if_else(class == "Open Water", "Water", class),
+         layer = "DUC") ##Open water
+Mayo_wet_sf <- Mayo_wet_sf %>% select(class = Class_Name) %>% 
+  mutate(class = if_else(class %in% c("Deep Water", "Shallow Water"), "Water", class), 
+         layer = "Mayo")#shallow water
+BR_wet_sf <- BR_wet_sf %>% select(class = Class_Name) %>% 
+  mutate(class = if_else(class %in% c("River", "Lake", "Shallow Water", "Exposed Fluvial"), "Water", class),
+         layer = "BR") ## river, lake, shallow water
+
+## Conver to same CRS
+crs <- "EPSG:3579"
+
+DUC_wet_sf <- DUC_wet_sf %>% 
+  st_transform(crs = crs)
+Mayo_wet_sf <- Mayo_wet_sf %>% 
+  st_transform(crs = crs) %>%
+  st_difference(st_transform(DUC_wet_ext, crs = crs))  #remove areas where overlaps with DUC
+wetland <- bind_rows(list(DUC_wet_sf, Mayo_wet_sf)) # combine into single feature
+
+## Beaver River overlaps with Mayo, so remove overlap area before mergins. 
+Mayo_wet_ext <- read_sf(file.path(gis_dir, "MayoWetlandClassification/MayoWetland_extent.shp")) ## Extent of mayo map
+wetland_ext <- bind_rows(list(st_transform(DUC_wet_ext, crs = crs),
+                              st_transform(Mayo_wet_ext, crs = crs))) # combine into single feature
+
+BR_wet_sf <- BR_wet_sf %>% 
+  st_difference(Mayo_wet_ext %>% st_transform(crs = st_crs(BR_wet_sf))) %>%
+  st_transform(crs = crs) 
+
+tmp <- BR_wet_ext
+BR_wet_ext <- tmp
+BR_wet_ext <- st_difference(BR_wet_ext, Mayo_wet_ext%>% st_transform(crs = st_crs(BR_wet_ext)) %>% st_union())
+
+BR_wet_ext <- st_as_sf(BR_wet_ext) %>% rename(geometry = x)
+# BR_wet_ext <- st_collection_extract(BR_wet_ext, type = c("POLYGON", "MULTIPOLYGON"))
+
+wetland <- bind_rows(list(wetland, BR_wet_sf))
+
+## same crs as wetland, label the layer
+##beaver River only overlaps partially with one site that is half overlapped by Mayo layer, so this site will be assigned 'mayo', and we don't need the BR extend. 
+wetland_ext <- bind_rows(
+  list(st_transform(DUC_wet_ext, crs = st_crs(wetland)) %>% 
+                      mutate(layer = "DUC") %>% select(layer), 
+       st_transform(Mayo_wet_ext, crs = st_crs(wetland)) %>% 
+         mutate(layer = "Mayo")%>% select(layer),
+        st_transform(BR_wet_ext, crs = st_crs(wetland)) %>% 
+    mutate(layer = "Mayo")%>% select(layer))) #half overlaps one site
+
+ggplot(wetland_ext %>% st_transform(crs = "EPSG:4326")) + geom_sf(aes(fill = layer)) + geom_sf(data = sites, aes(colour = factor(year))) ## not all sites have maps 
+
+```
+
+# Site selection 2 - Identify sites without wetlands inventories, updated disturbance data, and latitudinal outliers.
+
+```{r}
+### Do all sites have wetland layers?
+no.wet.stat.v <- sites$stationID[!st_intersects(sites, st_union(wetland_ext) %>% 
+                       st_transform(crs = st_crs(sites)),
+                     sparse = F)]
+no.wet.v <- unique(sites$siteID[!st_intersects(sites, st_union(wetland_ext) %>% 
+                       st_transform(crs = st_crs(sites)),
+                     sparse = F)])
+sites <- sites %>% mutate(wetland.layer = ifelse(stationID %in% no.wet.stat.v, F, T))
+ggplot(sites) + geom_sf(data = wetland_ext) + geom_sf(aes(col = wetland.layer)) ## a lot of the sites around steward crossing are going to be lost. These also coincide with sites in the Yukon Plateau-North ecoregion
+
+## remove sites without disturbance
+
+filter(sites,wetland.layer & !(dbuff | YG_update)) #1 station still missing disturbance data if we removes sites outside of wetland layers
+
+sites <- filter(sites, dbuff | YG_update)
+
+##Remove latitudinal outliers - these will be removed if we removes sites without a wetland layer, but this will ease comutation for now. 
+
+wcs.coord <- filter(sites, org == "WCS") %>% st_transform(crs = "EPSG:4326") %>% st_coordinates
+range(wcs.coord[,2])
+sites <- sites[st_coordinates(sites)[,2] > 950000,] ## removes 5 latitudinal outliers
+
+rm(DUC_wet_sf, Mayo_wet_sf, BR_wet_sf,
+   DUC_wet_ext, Mayo_wet_ext, BR_wet_ext)
+```
+
+# Habitat data
+
+**Note**: cropping to lists of sites is faster, but more memory
+intensive.
+
+### Elevation Data: GMTED
+
+Global Multi-resolution Terrain Elevation Data 2010 from the United
+States Geological Survey Download:
+<https://map-data.service.yukon.ca/Elevation/GMTED/>
+
+Crop the elevation raster to a buffer within 150m of each station.
+Calculate the average elevation within 150m of each station
+
+```{r}
+elev <- rast(file.path(gis_dir, "GMTED/50n150w_20101117_gmted_med075.tif"))
+names(elev) <- "elevation"
+
+##  elevation within a 150m buffer of each station 
+station_elev <- sites %>% 
+  st_buffer(dist = 150) %>%
+  st_transform(crs = crs(elev)) %>%
+  split(f = .$stationID) %>%
+  map(\(stat) crop(x = elev, y = stat, mask=T, touches = F))
+
+#mean elevation at each station
+elev_mn <- station_elev %>%
+    map(\(stat) global(stat, 'mean', na.rm = T)) %>% bind_rows() %>% mutate(stationID = names(station_elev))
+
+try(rm(elev, station_elev)) ## cleanup
+
+```
+
+# Land cover
+
+Having explored several land classification layers Nasa Above sseems the
+most appropriate for this region. The Macander plant functional type
+layers (<https://daac.ornl.gov/ABOVE/guides/AK_Yukon_PFT_TopCover.html>)
+are the other alternative. This is a more recent product (mapped for
+2015 and 2020), and maps the %cover of each plant functional type
+(conifer trees, broadleaf trees, deciduous shrubs, evergreen shrubs,
+graminoids, forbs, and light macrolichens) per pixel (i.e. continuous
+variable for each PFT vs a categorical habitat class). I was conserned
+that when summerising at the site level, important habitat structure
+information might be loss. For example,if a site is 50% open and 50%
+closed forest, and another site is 100% open forest, the average % cover
+of trees would be the same, but the habitat potential for specialist
+open or closed forest species would differ).
+
+## Nasa Above
+
+Landsat-derived Annual Dominant Land Cover Across ABoVE Core Domain,
+1984-2014 30-m resolution. The data are the annual dominant plant
+functional type in a given 30-m pixel derived from Landsat surface
+reflectance, landcover training data mapped across the ABoVE domain
+(using Random Forests modeling, with clustering and interpretation of
+field photography) and very high resolution imagery to assign land cover
+classifications. One product has a 15-class land cover classification
+that breaks out forest and shrub types into several additional classes;
+the other product provides a simplified, 10-class approach.
+
+2014 userAcc: evergreen_forest .75 deciduous_forest .86 shrub .73 herb
+.80 sparse_veg .76 barren .63 fen .58 bog .85 shallows .71 water .75
+
+Overall accuracy, 74.6%
+
+source: <https://daac.ornl.gov/ABOVE/guides/Annual_Landcover_ABoVE.html>
+
+THe NASA_Above.tif combines the grids for the yukon, shared by Caitlin
+Willier. Band 31 is the 2014 data (most recent)
+
+```{r}
+nasa_above <- rast(file.path(gis_dir, "Nasa_Above/Nasa_Above.tif"))
+nasa_above <- nasa_above[[31]]
+names(nasa_above) <- "lc" ##lc = land classification
+
+landc_cat <- data.frame(
+  lc = 1:15,
+  class = c("evergreen_forest", "deciduous_forest", "mixed_forest", "woodland", 
+            "shrub_low", "shrub_tall", "shrub_open", "herb", "tussock_tundra",
+            "sparce_veg", "fen_nasa", "bog_nasa", "shallows", "barren", "water"),
+  class10 = c("evergreen_forest", "deciduous_forest", "deciduous_forest",
+              "evergreen_forest", "shrub", "shrub", "shrub", "herb", "herb",
+            "sparce_veg",  "fen_nasa", "bog_nasa", "shallows", "barren", "water"))
+
+landc_cat[landc_cat$class == "shallows", c("class", "class10")] <- "water"
+
+##clip to 1500m buffer around each station
+
+tic()
+landc.ls <- sites %>%
+  split(.$siteID) %>%
+  map(function(s){
+    st_buffer(s, dist = 1500) %>% st_union() %>%
+      st_transform(crs = crs(nasa_above)) %>%
+      crop(x = nasa_above, y=., mask = T, touches = F) %>%
+      as.polygons() %>% st_as_sf() %>%
+      left_join(landc_cat)
+  })
+toc()
+
+landc.ls <- landc.ls %>% bind_rows() %>%
+  group_by(class) %>% summarise()  ## reduces each category to a multipolygon. This make computation faster. 
+
+try(rm(nasa_above))
+
+```
+
+# Fire polygons
+
+Recent burns are a fairly distinct habitat type, and burns after the
+land class layer will at minimum alter the mapped habitat type (from
+forest to open/herb/shrub), so we will add recent (\<30 years) burns to
+the land classification layer.
+
+Burn polygons were downloaded from GeoYukon. The year of the burn is
+included in the attribute table.
+
+```{r burn}
+# Read the feature class
+fire <- st_read(file.path(gis_dir, "Fire_History.shp/Fire_History.shp"))
+
+names(fire) <- tolower(names(fire))
+
+tictoc::tic()
+fire <- sites %>% 
+  st_buffer(dist = 1500) %>%
+  st_union() %>%
+  st_transform(crs = st_crs(fire)) %>%
+  st_intersection(x = fire, y = .)
+tictoc::toc()
+
+hist(fire$fire_year)
+# Attribute values are assigned to sub-geometries; if these are spatially
+# constant, as for instance for land use, then this is fine. If they are
+# aggregates, such as population count, then this is not fine
+
+ ## 9000 series seem to correspond with last two numbers of the decade.  Set to mid-decade for an average year?
+fire <- mutate(fire, fire_year = ifelse(fire_year > 2030,
+                                        decade + 5, fire_year)) %>%
+  select(fire_year) %>% 
+  group_by(fire_year) %>% summarise()
+
+
+```
+
+# Disturbance Data
+
+YG human footprint data May 2022 contains polygon, line (including NRN
+road), point (none overlapping with sites) and an extent layer (updated
+area). There are both 'most recent' and 'historic' database contents
+(historic being masked). I've filtered only most recent to reduce
+duplication. Some polygons/lines are still overlapping. THese can be
+found/visualised by running the layer in intersect to create a new layer
+containing overlapping features.
+
+To remove overlapping polygons: 1. Union the areal feature layer
+(creates identical polygons in overlap areas) 2. Calculate an
+'overlapID'(overlapping polygons will have the same ID). in attribute
+table, calculate new field as: str(!Shape_Leng!) + "-" +
+str(!Shape_Length!) + "-" + str(!Shape_Area!) 3. Dissolve. DIssolve
+field = overlapID, statistic = max Image_date. This selects the most
+recent of the overlapping polygons, but looses attributes of this area.
+Note: I tried a group by SQL query, but it didn't work in ArcGIS. (This
+processing might frankly all be easier in R after converting the .lry to
+.shp) 4. Calculate JoinID. In dissolve table this is str(!OverlapID) +
+"-" + str(!MAX_IMAGE_DATE!) and in union table str(!OverlapID) + "-" +
+str(!IMAGE_DATE!) 5. Join union table to dissolve on joinID Saved in\>
+CumulativeEffects_GIS/YG_SurfaceDisturbance_May2022/ArealFeatures_May2022_Un_Dis_J.shp
+
+To remove overlapping line segments: 1. 'Count overlapping features'
+tool: min overlap = 2. creates a new layer of lines with two or more
+overlapping lines from that layer. 2. 'Intersect' count layer with
+original layer to cut out duplicated segments 3. 'Dissolve' intersected
+layer. Dissolve: on FID_overlaplayer Statistic: Max year 4. Calculate
+joinID on dissolve and intersect layer using str(!FID\_...!) + "-"
+str(!IMAGE_DATE!) 5. 'Join field': intersect layer to dissolve to add
+the rest of the attributes 6. 'Erase' dissolve layer from original 7.
+'Merge' dissolve layer to erased layer. Remove attribute columns that
+are only in the dissolve layer (field map?). Note: still 11 duplicated
+line segments (not sure why), but all out of our field sites. Check in R
+for overlapping features after clipping out sites to check no further
+processing is required. Saved in\>
+CumulativeEffects_GIS/YG_SurfaceDisturbance_May2022/LinearFeatures_May2022_NoOverlap.shp
+
+WCS Digitizations:
+
+In 2021 (prior to YG update) surface and line disturbance was digitized
+within a 1.5k buffer of the centroid of *most* sites. . The buffer areas
+were visually examined and any other disturbance visible in imagery was
+digitized (in the 'added' layers). I later redigitized the surface
+disturbance polygons, identifying Bareground, Vegetated, and open water
+areas within each polygon based on areal imagery. Interpretation of the
+split point between bareground and vegetated wasn't always clear, so
+NDVI is a better approach to automate this (and also can be applied to
+2023 data). I also improved the borders of several polygons, and removed
+areas that were mistakenly digitized, so use these data when possible,
+and only original 2021 data for sites that have been added back in and
+weren't included in the initial digitization.
+
+In 2023, disturbance within 1750m buffer of all *stations* that was not
+covered by the MAY 2022 YG database were digitized.
+
+**which layers do we chose?** 2023 data can be added ontop of May 2022
+YG layer. 2021 data are loaded in along side the buffered YG layer that
+was digitized over. select the dataset with the most disturbance
+digitized.
+
+## Polygon disturbance
+
+```{r disturb}
+fgdb <- file.path(gis_dir, "CumEff_corrected_mjb.gdb") ## 2021 digitizations by WCSC
+fc_list <- st_layers(fgdb)
+print(fc_list)
+p.dist <- st_as_sf(vect(fgdb, layer="Polygon_disturbance_VegBareWater"))
+
+## these were the sites included when VegBareWater were redigitized. 
+
+#st_write(sites , file.path(pipeline, "store", "sites_analysis.shp"), delete_layer=T) ## sites that should be included in VegBareWater
+site.v <- unique(sites$siteID)
+missing.d <- site.v[site.v %in% c(bad.bz, no.wet.v)] ## these were stations that were skipped from 2017-2021 disturbance digitization. 
+
+
+##since we are now using NDVI to separate Bare, vegetated and water dsiturbance areas, we can also add in 2023 data and missing 2021 sites. 
+
+##2023 data
+p.dist.23 <- read_sf(file.path(gis_dir,"ClaraDigitization_2023/Sites_ArealDist_Intersect.shp")) %>% st_transform(crs = crs) %>% select(Shape_Leng, Shape_Area, geometry)
+p.dist.23added <- read_sf(file.path(gis_dir,"ClaraDigitization_2023/ArealDist_Added_XY.shp")) %>% st_transform(crs = crs)
+p.dist.23 <- rbind(p.dist.23, p.dist.23added)
+
+### The original 2021 digitization
+# Read in disturbance polygons
+p_dist_ns <- vect(fgdb, layer = "Polygon_disturbance_NS_NoOverlap")
+p_dist_a_ns <- vect(fgdb, layer = "Polygon_disturbance_added_NS")
+p_dist_hs <- vect(fgdb, layer = "Polygon_disturbance_HS_cor")
+p_dist_a_hs <- vect(fgdb, layer = "Polygon_disturbance_added_HS_cor")
+
+
+#clean files, and make more uniform
+p_dist_ns <- p_dist_ns %>% select(siteID = Id, lat_dist = lat, lon_dist = long, ##lat/lon in
+                                  area_m2 = Shape_Area,
+                                  type = TYPE_INDUSTRY,
+                                  subtype = TYPE_DISTURBANCE,
+                                  database = DATABASE,
+                                  image = IMAGE_NAME,
+                                  image_date = IMAGE_DATE,
+                                  image_res = IMAGE_RESOLUTION,
+                                  image_sensor = IMAGE_SENSOR,
+                                  pc_disturb = disturb, ##ranking from field
+                                  pc_intensity = intensity, ##ranking from field
+                                  pc_type = type ##classification from field
+) %>% mutate(gis_layer = "Polygon_disturbance_NS_NoOverlap")
+
+p_dist_a_ns <- p_dist_a_ns %>% select(siteID = Id, lat_dist = lat, lon_dist = long, ##lat/lon in
+                                      area_m2 = Shape_Area,
+                                      type = TYPE,
+                                      subtype = SUBTYPE,
+                                      database = ORIGINAL_DB,
+                                      image = IMAGE_NAME,
+                                      image_date = IMAGE_DATE,
+                                      image_res = IMAGE_RESOLUTION,
+                                      image_sensor = IMAGE_SENSOR,
+                                      pc_disturb = disturb, ##ranking from field
+                                      pc_intensity = intensity, ##ranking from field
+                                      pc_type = type_1 ##classification from field
+)  %>% mutate(gis_layer = "Polygon_disturbance_added_NS") %>% select(names(p_dist_ns))
+
+p_dist_ns <- rbind(p_dist_ns, p_dist_a_ns)
+
+
+#clean files, and make more uniform
+p_dist_hs <- p_dist_hs %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                  area_m2 = Shape_Area,
+                                  type = TYPE_INDUSTRY,
+                                  subtype = TYPE_DISTURBANCE,
+                                  database = DATABASE,
+                                  image = IMAGE_NAME,
+                                  image_date = IMAGE_DATE,
+                                  image_res = IMAGE_RESOLUTION,
+                                  image_sensor = IMAGE_SENSOR
+) %>% mutate(gis_layer = "Polygon_disturbance_HS_cor")
+
+p_dist_a_hs <- p_dist_a_hs %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1, ##lat/lon in
+                                      area_m2 = Shape_Area,
+                                      type = TYPE,
+                                      subtype = SUBTYPE,
+                                      database = ORIGINAL_DB,
+                                      image = IMAGE_NAME,
+                                      image_date = IMAGE_DATE,
+                                      image_res = IMAGE_RESOLUTION,
+                                      image_sensor = IMAGE_SENSOR,
+)  %>% mutate(gis_layer = "Polygon_disturbance_added_HS_cor") %>% select(names(p_dist_hs))
+
+p_dist_hs <- rbind(p_dist_hs, p_dist_a_hs)
+
+p_dist_hs <- st_as_sf(p_dist_hs)
+p_dist_ns<-st_as_sf(p_dist_ns)
+
+p_dist_hs <- p_dist_hs %>% separate(col = siteID, into = c("location_3", "location_4"), sep = "-") %>% ##splits into 6 number code + letter/number
+  mutate(siteID = paste(location_3, str_extract(location_4, "[A-Z]+" ), sep = "-")) %>% ##hex code + letter
+  select(-starts_with("location_") )
+
+p.dist.2021 <- rbind(p_dist_ns %>% select(type, subtype), p_dist_hs %>% select(type, subtype))
+
+
+p.dist.2021<- st_transform(p.dist.2021, st_crs(sites))
+
+###this filters out sites already in p.dist
+p.dist.2021 <- st_intersection(sites %>% filter(siteID %in% missing.d) %>%
+                                 st_buffer(2000),
+                               p.dist.2021)
+
+## Merge p.dist for sites <= 2021 ----
+
+p.dist <- st_union(p.dist) ## redigitized in 2022 to identify bare, veg and water
+p.dist.2021 <- st_union(p.dist.2021) ## sites from 2021 or earlier that weren't included in p.dist
+p.dist <- rbind(st_as_sf(p.dist), st_as_sf(p.dist.2021)) ## all 2021 sites in a single layer
+
+## disturbance is updated annually (e.g. imagery from year of survey or earlier was used)
+## This creates a list, where each element corresponds to the survey year. Disturbance data from within this year are cropped within a 2000m buffer of each station surveyed in the given year
+  tictoc::tic()
+p.dist.yr <- sites %>%
+  st_buffer(dist = 2000) %>%
+  st_transform(crs = st_crs(p.dist)) %>%
+  split(sites$year) %>%
+  map(\(x) st_intersection(x = p.dist, y = st_union(x)))
+tictoc::toc()
+
+##replace 2023 disturbance data with data from Clara's digitization (includes both YG and her added areas)
+p.dist.yr[[4]] <- sites %>% filter(year == 2023) %>%
+  st_buffer(dist = 2000) %>%
+  st_transform(crs = st_crs(p.dist.23)) %>%
+  st_union() %>%
+  st_intersection(x = p.dist.23, y = .) %>% st_union() %>%
+  st_as_sf()
+```
+
+##NDVI and Watermasks.
+
+To make bare/vegetated separation more repeatable across sites/years, we
+use NDVI (NIR and Red) and a water mask (normalized difference between
+bands B3/Green and B8/NIR on sentinel 2 )
+
+sentinel 2 TOA images (S2 harmonized) were process in GEE. The median
+band value from images between May 15 and Sep 1 in a given year was
+calculated per band. A cloud mask was applied so cloud values did not
+contribute to median (maskS2clouds). Several water indexes were compared
+based on the maximum kappa values across a range of thresholds, and the
+normalized difference between B3 and B8 performed best. I selected a
+threshold value of 0.046, which maximises the agreement between the
+digitized layers (water vs other disturbance) and NDWI seperation,
+without balancing the number of samples of water vs land (a lot more
+land, so the threshold only seperates unambigous water, whereas
+intermediate values are classified as land. Water is correctly
+identified 37% of the time, with the remainder being largely classified
+as bare ground. See 1_code/watermask_exploration.R for different NDWI
+comparisons. This is pretty terrible performance. Some of these missed
+areas might be captured in the wetland layers or NASA above land
+classification, but I'm doubtful. I'm keeping the seperation as it at
+least identifies larger and deeper bodies of water where ducks, etc.,
+might be found. It is the shallows that seem to be skipped.
+
+NDVI values of disturbance classified as bare vs vegetation were then
+compared again using the kappa value. This time, the digitized data were
+randomly sampled so that the number of bare ground areas = the number of
+vegetated areas. The thresholds best separating bare and vegetation was
+NDVI = 0.42. This line falls between the two peaks of NDVI for Bare and
+Vegetation. sampling made sense because our division of bare and
+vegetation were already subjective, and we don't want to be more
+conservative in our classification in either direction. This was done in
+1_code/s2_thresholds.R
+
+the S2 images were reclassified into a watermask layer and a veg mask
+layer and converted to polygons. These can be combined and clipped with
+the disturbance polygons to create separate disturbance classes.
+
+```{r}
+
+files <- list.files("E:/Archive/0_data/GEE", pattern = "B3B8")
+files <- files[!str_detect(files, "tif.")]
+watermask <- pmap(list(p.dist.yr, c("2017", "2018", "2021","2023","2024")),
+                                function(p.dist, yr){
+  file <- files[str_which(files, yr)]
+  r <- rast(file.path("E:/Archive/0_data/GEE", file))
+  crs.r <- terra::crs(r)
+  r = crop(x = r, y = p.dist %>% st_transform(crs = crs.r), mask=T, touches = F)
+  r <- r > 0.046
+  r
+    })
+write_rds(watermask, file.path("E:/Archive",pipeline, "store", "watermask_dclip_rast.rds"))
+
+files <- list.files("E:/Archive/0_data/GEE/", pattern = "ndvi")
+files <- files[!str_detect(files, "tif.")] ## removes potential tif.aux files, e.g. if ArcGIS is open
+vegmask <- pmap(list(p.dist.yr, c("2017", "2018","2021","2023","2024")), function(p.dist, yr){
+  file <- files[str_which(files, yr)]
+  r <- rast(file.path("E:/Archive/0_data/GEE/", file))
+  r = crop(x = r, y = p.dist %>% st_transform(crs = terra::crs(r)), mask=T, touches = F)
+  r > 0.42
+})
+write_rds(vegmask, file.path("E:/Archive",pipeline, "store", "vegmask_dclip_rast.rds"))
+
+## for communityAnalysis.R
+# veg23 <- rast("0_data/GEE/ndvi_2023.tif")
+# veg23 <- crop(x = veg23, y = p.dist.yr$'2023' %>% st_transform(crs = terra::crs(veg23), 
+#                                                                mask=T, touches = F))
+# veg23.site <- map(sites %>% filter(year == 2023) %>% group_by(siteID) %>% summarise() %>% 
+#                     st_buffer(150) %>% split(., f = .$siteID), function(site.p){
+#                   r <-  tryCatch(crop(x = veg23, y = site.p %>% 
+#                               st_transform(crs = terra::crs(veg23), mask=T, touches = F)), 
+#                            error = function(e) NULL)
+#                   })
+# 
+# veg23.site <- veg23.site[!sapply(veg23.site, is.null)] #no overlap with surface disturbance
+# 
+# veg23.site <- map(veg23.site, function(r) {
+#   mask(r, vect(p.dist.yr$'2023' %>% st_transform(crs = terra::crs(veg23))))
+# })
+# 
+# disturb.ndvi <- sapply(veg23.site, function(r) median(values(r), na.rm = T))
+# disturb.ndvi.med <- disturb.ndvi[!is.na(disturb.ndvi)]
+# # disturb.ndvi <- sapply(veg23.site, function(r) mean(values(r), na.rm = T))
+# # disturb.ndvi.mn <- disturb.ndvi[!is.na(disturb.ndvi)]
+# write_rds(disturb.ndvi.med, file.path(pipeline, "store", "disturb_ndvi_median_23.rds"))
+
+
+p.dist <- pmap(list(vegmask, watermask), function(v, w){
+  v <- as.numeric(v)
+  mask(x = v, mask = w, maskvalues = TRUE, updatevalue = 3)
+})  ## 1 = veg, 0 = bare, 3 = water
+write_rds(p.dist, file.path("E:/Archive",pipeline, "store", "p.dist_rast.rds"))
+
+type.df <- data.frame(typeID = c(1, 0, 3), type = c("d_pVeg", "d_pBare", "d_pWater"))
+p.dist <- map(p.dist, function(r){
+  p <- as.polygons(r)
+  names(p) = "typeID"
+  p = st_as_sf(p) %>% left_join(type.df)
+})
+write_rds(p.dist, file.path("E:/Archive/",pipeline, "store", "p.dist_p.rds"))
+
+
+rm(vegmask, watermask)
+
+## add site ID
+sites.yr <- sites %>% st_buffer(1500) %>% 
+  group_by(year) %>% summarise() %>% 
+  st_transform(crs = crs <- "EPSG:3579")%>%
+  split(.$year) 
+
+saveRDS(sites.yr, file.path("E:/Archive",pipeline, "store", "sites_yr.RDS"))
+
+# p.dist.sites <- pmap(list(sites.yr , p.dist), function(site, dist){
+#     st_intersection(site, dist %>% st_transform(crs = st_crs(landc.ls)))
+#   })
+# 
+# 
+# ## plot sites to check that it all makes sense
+# # MR80 & 81 = victoria gold
+# filter(p.dist.sites[[4]], siteID %in% c("MR80", "MR81")) %>%
+#   ggplot() + geom_sf(aes(fill = type))
+# 
+# # MR48 = Duncan creek drainage ponds
+# filter(p.dist.sites[[4]], siteID == "MR48") %>%
+#   ggplot() + geom_sf(aes(fill = type)) ## missing water
+# 
+# # MR15 = Indian River duck ponds
+# filter(p.dist.sites[[4]], siteID == "MR15") %>%
+#   ggplot() + geom_sf(aes(fill = type))
+# 
+# # MR73 = SUlfer community horseshoe
+# filter(p.dist.sites[[4]], siteID == "MR73") %>%
+#   ggplot() + geom_sf(aes(fill = type)) ## missing water
+# 
+# future::plan("sequential")
+```
+
+# Combined habitat polys
+
+Remove disturbance from burns and land classification layers.
+
+Select recent burns (within 30 years of survey) which likely retain
+characteristics unique to burned areas. Remove burned area from land
+class layer. Combine the three layers. There should now be no overlap
+between these layers, using the following priority: disturbance \> fire
+\> landclass
+
+I'm allowing wetland areas to co-occur with different habitat types...
+e.g. a swamp can both be a wetland as well as classified as coniferous
+forest. Wetlands within disturbance polygons should be added to d_pWater
+(from the watermask), but can also co-occur with bare/vegetated
+disturbance classificaton (mostly because I"m not sure I trust the
+wetland mapping in disturbed areas... but also this reflects the
+approach taken with the habitat layers). Water captured by the watermask
+(e.g. deeper open bodies of water) will still be separated.
+
+```{r hab poly}
+
+##save originals before editing
+saveRDS(wetland, file.path("E:/Archive",pipeline, "store", "wetlandPoly.RDS")) #polygon
+saveRDS(fire, file.path("E:/Archive",pipeline, "store", "firePoly.RDS")) #polygon
+saveRDS(landc.ls, file.path("E:/Archive",pipeline, "store", "landcPoly.RDS")) ## raster, cropped to site buffer
+saveRDS(sites, file.path("E:/Archive",pipeline, "store", "sites_habpoly.RDS"))
+
+p.dist <- read_rds(file.path("E:/Archive",pipeline, "store", "p.dist_p.rds"))
+wetland <- readRDS(file.path("E:/Archive",pipeline, "store", "wetlandPoly.RDS"))
+fire <- readRDS(file.path("E:/Archive",pipeline, "store", "firePoly.RDS"))
+landc.ls<- readRDS(file.path("E:/Archive",pipeline, "store", "landcPoly.RDS"))
+sites <- readRDS(file.path("E:/Archive",pipeline, "store", "sites_habpoly.RDS"))
+sites.yr <- readRDS(file.path("E:/Archive",pipeline, "store", "sites_yr.RDS"))
+
+crs <- "EPSG:3579" ## use projected crs for intersections
+
+site.buff <- sites %>% ## recrop to selected sites, smaller buffer
+  st_buffer(dist = 1500) %>%
+  group_by(siteID, year) %>% summarise() %>%
+  st_transform(crs = crs)
+
+## transform to same crs
+p.dist <- map(p.dist, function(site) site %>% st_transform(crs = crs))
+sites.yr <- map(sites.yr, function(site) site %>% st_transform(crs = crs))
+wetland<-st_as_sf(wetland)
+wetland <- wetland %>% st_transform(crs = crs)
+fire <- fire %>% st_transform(crs = crs)
+landc.ls <- landc.ls %>% st_transform(crs = crs)
+
+## crop all to sites.yr
+
+wetland <- map(sites.yr, function(site){
+    st_intersection(site, wetland %>% 
+                      select(class, layer)) %>%
+    group_by(class, layer) %>% summarize()
+  })
+
+landc.ls <- map(sites.yr, function(site){
+      st_intersection(site, landc.ls %>% select(class)) %>%
+    group_by(class) %>% summarize() 
+  })
+
+
+
+###Fire vs Nasa Above ----
+### THis is an exploration to see how time since burn corresponds with the Nasa Above Land classification. This will support identifying all burns within 30 years. 
+## We are using 2014 to calculate age of burn, as this is the year of the Nasa Above Dataset
+
+# fire_comp.l <- map(sites.yr, function(site){
+#     fr = st_intersection(site, fire)
+#     fr %>% mutate(diff = 2014 - fire_year,
+#                   class = ifelse(diff %in% 0:9, "Burn-herb",
+#                                  ifelse(diff %in% 10:19,"Burn-shrub",
+#                                         ifelse(diff %in% 20:29, "Burn-sappling",
+#                                                ifelse(diff %in% 30:39, "Burn-sappling+","Burn-old")))),
+#                   layer = "fire") %>%
+#       filter(class != "Burn-old") %>% ## remove old burns and burns that haven't happened
+#       arrange(diff) %>% st_difference() %>% #remove overlapping burns, selecting most recent
+#       group_by(class, layer) %>% summarise()
+#   })
+# 
+# 
+# fire_comp <- pmap(list(fire_comp.l, landc.ls), function(fr, hp){
+#   fr = fr %>%  mutate(class = paste0("H_", tolower(class)))
+#   st_intersection(fr, hp)
+# })
+# 
+# fire_comp <- bind_rows(fire_comp)
+# fire_comp$area <- st_area(fire_comp)
+# tmp <- fire_comp %>% group_by(class, class.1) %>% summarise(lc.area = sum(area))
+# fire_comp1 <- fire_comp %>% group_by(class) %>% summarise(f.area = sum(area)) %>% st_drop_geometry() %>%
+#   left_join(st_drop_geometry(tmp)) %>% mutate(p.area = lc.area/f.area)
+# fire_comp1 %>% arrange(desc(p.area)) %>% filter(class == "H_burn-herb") ##77.6% open, 16.3% woodland, 5.8% evergreen forest.
+# 
+# fire_comp1 %>% arrange(desc(p.area)) %>% filter(class == "H_burn-shrub") ##72% as open, 18% as woodland, 2.7% evergreen
+# 
+# fire_comp1 %>% arrange(desc(p.area)) %>% filter(class == "H_burn-sappling") ##62% open, 28.9% woodland, 7.5% forest
+# 
+# fire_comp1 %>% arrange(desc(p.area)) %>% filter(class == "H_burn-sappling+") ##35% open, 16% woodland, 48% forest
+# ## If we want to remove the burn category, best to classify areas burned within the last 30 years as open habitat.
+# ## after 30 years, area seems to be much more comparable to forested sites. 
+
+
+## classify fire by age, and remove older burns >= 30 years old
+fire <- map(sites.yr, function(site){
+    fr = st_intersection(site, fire)
+    fr %>% mutate(diff = year - fire_year, 
+                  class = ifelse(diff %in% 0:9, "Burn-herb",
+                                 ifelse(diff %in% 10:19,"Burn-shrub", 
+                                        ifelse(diff %in% 20:29, "Burn-sappling", "Burn-old"))),
+                  layer = "fire") %>% 
+      filter(class != "Burn-old") %>% ## remove old burns and burns that haven't happened
+      arrange(diff) %>% st_difference() %>% #remove overlapping burns, selecting most recent
+      group_by(class, layer) %>% summarise()
+  })
+
+
+##  separate wetlands into natural and disturbed----
+
+wetland <- pmap(list(p.dist, wetland), function(disturb, wet){
+  h_wt <- st_difference(wet, st_union(disturb)) ## remove wetlands in disturbance, leaving natural wetlands
+  h_wt$class = paste0("H_", tolower(h_wt$class))
+  wt <- st_intersection(wet, st_union(disturb)) ## wetland in disturbance area
+  d_water <- st_difference(disturb %>% filter(type == "d_pWater"), st_union(wt)) ## mapped water not in wetland area
+  wt$class = paste0("D_", tolower(wt$class))
+  d_water %>% select(class = type) %>% mutate(layer = "NDWI") %>% select(names(wt)) %>%
+    rbind(wt) %>% rbind(h_wt)
+})
+
+### disturb > fire > landclass ----
+
+hab.poly <- map(p.dist, function(disturb){
+  disturb <- disturb %>% 
+      mutate(class = type, layer = "YGfootprint_CWS_update") %>% 
+      select(class, layer) 
+
+})
+
+## remove disturb from burnt areas
+## fire age/class varies by siteID
+fire <- pmap(list(fire, hab.poly), function(fr, hp){
+  fr = fr %>%  mutate(class = paste0("H_", tolower(class)))
+  st_difference(fr, st_union(hp))
+})
+
+### merge fire, and disturbance 
+hab.poly <- pmap(list(hab.poly, fire), function(x, y){
+    y <- y  %>% select(class, layer)
+    bind_rows(list(x,y))
+})
+
+
+##Nasa Above
+## erase disturb + fires from nasa above landclass
+landc.ls <- pmap(list(hab.poly, landc.ls), function(x, y){
+  y <- st_difference(y, st_union(x))
+  y$class = paste0("H_", tolower(y$class))
+  y
+})
+
+
+hab.poly <- pmap(list(hab.poly, landc.ls), function(x, y){
+    y <- y %>% mutate(layer = "nasa_above") %>% select(class, layer)
+    bind_rows(list(x,y))
+})
+
+## by site
+hab.poly.site <- pmap(list(hab.poly, site.buff %>% split(.$year)), 
+                      function(hab, sy){
+  site <- split(sy, sy$siteID)
+  map(site, function(s){
+    st_intersection(s, hab) 
+  }) %>% 
+      bind_rows()
+}) %>% bind_rows()
+
+wetland.site <- pmap(list(wetland, site.buff %>% split(.$year)), 
+                      function(hab, sy){
+  site <- split(sy, sy$siteID)
+  map(site, function(s){
+    st_intersection(s, hab) 
+  }) %>% 
+      bind_rows()
+}) %>% bind_rows()
+
+wetland.site <- wetland.site %>% mutate(class2 = ifelse(str_starts(class,"H_"), "h_wet", "d_wet")) 
+
+# ggplot(hab.poly.site %>% filter(siteID == "MR15")) + geom_sf(aes(fill = class)) + geom_sf(data = wetland.site%>% filter(siteID == "MR15"), alpha = .5, aes(colour = class2))
+# ggplot(wetland.site %>% filter(siteID == "MR15")) + geom_sf(aes(fill = class2), alpha = .5)
+
+# ggplot(hab.poly.site %>% filter(siteID == "369709-A")) + geom_sf(aes(fill = class), alpha = .5) + geom_sf(data = wetland.site%>% filter(siteID == "369709-A"), alpha = .5, aes(colour = class2))
+# ggplot(wetland.site %>% filter(siteID == "369709-A")) + geom_sf(aes(fill = class2), alpha = .5)
+
+##station.  first need to match station to site.  
+hab.poly.station <- pmap(list(hab.poly, 
+                              sites %>% st_buffer(1500) %>% split(.$year)), 
+                         function(hab, sy){
+  site <- split(sy %>% select(siteID, station, stationID), sy$stationID)
+  map(site, function(s){
+    st_intersection(s, hab) 
+  }) %>% 
+      bind_rows()
+}) %>% bind_rows()
+
+wetland.station <- pmap(list(wetland, 
+                              sites %>% st_buffer(1500) %>% split(.$year)), 
+                         function(hab, sy){
+  site <- split(sy %>% select(siteID, station, stationID), sy$stationID)
+  map(site, function(s){
+    st_intersection(s, hab) 
+  }) %>% 
+      bind_rows()
+}) %>% bind_rows()
+
+wetland.station <- wetland.station %>% mutate(class2 = ifelse(str_starts(class,"H_"), "h_wet", "d_wet"))
+# ggplot(hab.poly.station %>% filter(stationID == "MR15-2")) + geom_sf(aes(fill = class)) + geom_sf(data = wetland.station%>% filter(stationID == "MR15-2"), alpha = .5, aes(colour = class2))
+
+saveRDS(hab.poly.station, file.path("E:/Archive",pipeline, "store", "lcmerge_stat.RDS"))
+saveRDS(hab.poly.site, file.path("E:/Archive",pipeline, "store", "lcmerge.RDS"))
+saveRDS(wetland.site, file.path("E:/Archive",pipeline, "store", "wetland_site.RDS"))
+saveRDS(wetland.station, file.path("E:/Archive",pipeline, "store", "wetland_station.RDS"))
+
+rm(fire, landc.ls, wetland, p.dist, p.dist.yr, p.dist.23, d.buff2021, d.buffHist)
+
+```
+
+# Linear Disturbance
+
+Linear features come in several classes (e.g. road, cutline, trail) and
+widths/width classes (\< 4 m, 4 - 7 m and \> 7 m). The widths of
+features likely aren't overly accurate, especially in the YG dataset,
+which was based on lower resolution Spot imagery.
+
+Similar to surface disturbance, Pat digitized linear features for most
+sites in 2017-2021 on an earlier version of the YG human footprint
+layer, and Clara digitized sites in 2023 ontop of the YG 2022 release.
+
+For the 2021 and earlier sites, I've compared the total distance of
+linear features between the WCSC digitization and the YG update and used
+the one with more linear features. For 2023, since it was digitized on
+top of the most recent human footprint layer, I've used Clara's combined
+digitizations.
+
+Note: Duplicated linesegments were removed from May2022 YG dataset and
+the output was saved as
+YG_SurfaceDisturbance_May2022/LinearFeatures_May2022_NoOverlap.shp
+
+Note: YG update extent does not seems to include recent disturbance in
+Mayo region (or detailed disturbance).
+
+```{r linear Disturb}
+## YG 2022 version ----
+l_dist_2022 <- read_sf(file.path(gis_dir, "YG_SurfaceDisturbance_May2022/LinearFeatures_May2022_NoOverlap.shp"))
+
+l_dist_2022 <- l_dist_2022 %>% select(length_m = Shape_Leng, 
+                                  width_m = WIDTH_M,
+                                  width_class = WIDTH_CLAS,
+                                  type = TYPE_INDUS,
+                                  subtype = TYPE_DISTU,
+                                  database = DATABASE,
+                                  image = IMAGE_NAME,
+                                  image_date = IMAGE_DATE,
+                                  image_res = IMAGE_RESO,
+                                  image_sensor = IMAGE_SENS) %>%
+  st_transform(crs = st_crs(sites))
+
+##2023 digitization, added ontop of 2022 layer ----
+l_dist_2023 <- read_sf(file.path(gis_dir, "ClaraDigitization_2023/LinDist_Added_XY.shp")) ## can add to l_dist_2022 because it was created with the 2022 layer as the base
+
+l_dist_2023 <- l_dist_2023 %>% rename(length_m= Shape_Leng, 
+                                  width_m = Width_M,
+                                  width_class = Width_Clas,
+                                  type = Type,
+                                  subtype = Subtype,
+                                  image = Image_Name,
+                                  image_date = Image_Date,
+                                  image_res = Image_Reso,
+                                  image_sensor = Image_Sens) %>%  
+  mutate(database = NA)  %>% st_transform(crs = st_crs(sites))
+
+l_dist_2022 <- bind_rows(list(l_dist_2023, l_dist_2022)) ## can add to l_dist_2022 because it was created with the 2022 layer as the base
+
+table(l_dist_2022$width_class) 
+l_dist_2022[l_dist_2022$width_class %in% c("High", "High (>8m)"),]$width_class <- "HIGH"
+l_dist_2022[l_dist_2022$width_class %in% c("Med (4-8m)"),]$width_class <- "MED"
+l_dist_2022[l_dist_2022$width_class %in% c("Low (<4m)"),]$width_class <- "LOW"
+
+
+### 2021 digitization by WCSC, made over an earlier version of the human footprint layer. ----
+fgdb <- file.path(gis_dir, "CumEff_corrected_mjb.gdb")
+l_nrn_ns <- st_as_sf(vect(fgdb, layer="NRNYukonRoadSegments_NS_cor"))
+l_nrn_hs <- st_as_sf(vect(fgdb, layer="NRNYukonRoadSegments_HS"))
+l_nrn_hs2 <- st_as_sf(vect(fgdb, layer="NRN_Disturbance_368280_D2"))
+l_dist_ns <- st_as_sf(vect(fgdb, layer="Line_disturbance_NS_cor"))
+l_dist_a_ns <- st_as_sf(vect(fgdb, layer="Line_disturbance_added_NS"))
+l_dist_hs <- st_as_sf(vect(fgdb, layer="Line_disturbance_HS_cor"))
+l_dist_a_hs <- st_as_sf(vect(fgdb, layer="Line_disturbance_added_HS_cor"))
+l_dist_hs2 <-  st_as_sf(vect(fgdb, layer="Line_Disturbance_368280_D2"))
+
+l_nrn_ns <- l_nrn_ns %>% select(siteID = Id, lat_dist = lat, lon_dist = long, ##lat/lon in 
+                                length_m = Shape_Leng, 
+                                n_lanes = NBRLANES,
+                                subtype = ROADCLASS,
+                                pc_disturb = disturb, ##ranking from field
+                                pc_intensity = intensity, ##ranking from field
+                                pc_type = type ##classification from field
+                                ) %>% 
+  mutate(gis_layer = "NRNYukonRoadSegments_NS_cor", type = "Transportation",
+             database = "NRNYukonRoadSegments", 
+             image = NA, image_date = NA, image_res = NA,
+             image_sensor = NA, 
+             width_m = NA,
+             width_class = NA)
+
+l_dist_ns <- l_dist_ns %>% select(siteID = Id, lat_dist = lat, lon_dist = long, ##lat/lon in 
+                                  length_m = Shape_Length, 
+                                  width_m = WIDTH_M,
+                                  width_class = WIDTH_CLASS,
+                                  type = TYPE_INDUSTRY,
+                                  subtype = TYPE_DISTURBANCE,
+                                  database = DATABASE,
+                                  image = IMAGE_NAME,
+                                  image_date = IMAGE_DATE,
+                                  image_res = IMAGE_RESOLUTION,
+                                  image_sensor = IMAGE_SENSOR,
+                                  pc_disturb = disturb, ##ranking from field
+                                  pc_intensity = intensity, ##ranking from field
+                                  pc_type = type ##classification from field
+) %>% mutate(gis_layer = "Line_disturbace_NS_cor", n_lanes = NA) %>%
+  select(names(l_nrn_ns))
+
+l_dist_a_ns <- l_dist_a_ns %>% select(siteID = Id, lat_dist = lat, lon_dist = long, ##lat/lon in 
+                                      length_m = SHAPE_Length, 
+                                      width_m = WIDTH_M,
+                                      width_class = WIDTH_CLASS,
+                                      type = TYPE,
+                                      subtype = SUBTYPE,
+                                      database = ORIGINAL_DB,
+                                      image = IMAGE_NAME,
+                                      image_date = IMAGE_DATE,
+                                      image_res = IMAGE_RESOLUTION,
+                                      image_sensor = IMAGE_SENSOR,
+                                      pc_disturb = disturb, ##ranking from field
+                                      pc_intensity = intensity, ##ranking from field
+                                      pc_type = type_1 ##classification from field
+)  %>% mutate(gis_layer = "Line_disturbance_added_NS", n_lanes = NA) %>%
+  select(names(l_nrn_ns))
+
+
+l_nrn_hs <- l_nrn_hs %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                length_m = Shape_Length, 
+                                n_lanes = NBRLANES,
+                                subtype = ROADCLASS,
+) %>% mutate(gis_layer = "NRNYukonRoadSegments_HS_cor", type = "Transportation",
+             database = "NRNYukonRoadSegments", 
+             image = NA, image_date = NA, image_res = NA,
+             image_sensor = NA, 
+             width_m = NA,
+             width_class = NA)
+
+l_nrn_hs2 <- l_nrn_hs2 %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                  length_m = Shape_Length, 
+                                  n_lanes = NBRLANES,
+                                  subtype = ROADCLASS,
+) %>% mutate(gis_layer = "NRN_Disturbance_368280_D2", type = "Transportation",
+             database = "NRNYukonRoadSegments", 
+             image = NA, image_date = NA, image_res = NA,
+             image_sensor = NA, 
+             width_m = NA,
+             width_class = NA)
+
+l_nrn_hs <- rbind(l_nrn_hs, l_nrn_hs2)##buffer missed in first round, so merge clip
+
+l_dist_hs <- l_dist_hs %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                  length_m = Shape_Length, 
+                                  width_m = WIDTH_M,
+                                  width_class = WIDTH_CLASS,
+                                  type = TYPE_INDUSTRY,
+                                  subtype = TYPE_DISTURBANCE,
+                                  database = DATABASE,
+                                  image = IMAGE_NAME,
+                                  image_date = IMAGE_DATE,
+                                  image_res = IMAGE_RESOLUTION,
+                                  image_sensor = IMAGE_SENSOR,
+) %>% mutate(gis_layer = "Line_disturbance_HS_cor", n_lanes = NA) %>%
+  select(names(l_nrn_hs))
+
+##buffer missed in first round, so merge clip
+l_dist_hs2 <- l_dist_hs2 %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                    length_m = Shape_Length, 
+                                    width_m = WIDTH_M,
+                                    width_class = WIDTH_CLASS,
+                                    type = TYPE_INDUSTRY,
+                                    subtype = TYPE_DISTURBANCE,
+                                    database = DATABASE,
+                                    image = IMAGE_NAME,
+                                    image_date = IMAGE_DATE,
+                                    image_res = IMAGE_RESOLUTION,
+                                    image_sensor = IMAGE_SENSOR,
+) %>% mutate(gis_layer = "Line_Disturbance_368280_D2", n_lanes = NA) %>%
+  select(names(l_nrn_hs))
+
+l_dist_hs <- rbind(l_dist_hs, l_dist_hs2)##buffer missed in first round, so merge clip
+
+l_dist_a_hs <- l_dist_a_hs %>% select(siteID = loc_name, lat_dist = location_l, lon_dist = location_1,
+                                      length_m = Shape_Length, 
+                                      width_m = WIDTH_M,
+                                      width_class = WIDTH_CLASS,
+                                      type = TYPE,
+                                      subtype = SUBTYPE,
+                                      database = ORIGINAL_DB,
+                                      image = IMAGE_NAME,
+                                      image_date = IMAGE_DATE,
+                                      image_res = IMAGE_RESOLUTION,
+                                      image_sensor = IMAGE_SENSOR,
+)  %>% mutate(gis_layer = "Line_disturbance_added_HS_cor", n_lanes = NA) %>%
+  select(names(l_nrn_hs))
+
+## combine the 2021 digitization files
+l_dist_ns <- rbind(st_transform(l_nrn_ns, crs = st_crs(l_dist_ns)), l_dist_ns, l_dist_a_ns)
+
+l_dist_hs<-st_transform(l_dist_hs,crs=st_crs(l_dist_a_hs))
+
+#SET SAME CRS?!! 
+l_dist_hs <- rbind(st_transform(l_nrn_hs, crs = st_crs(l_dist_hs)), l_dist_hs, l_dist_a_hs)
+l_dist_hs <- l_dist_hs %>% separate(col = siteID, into = c("location_3", "location_4"), sep = "-") %>% ##splits into 6 number code + letter/number
+  mutate(siteID = paste(location_3, str_extract(location_4, "[A-Z]+" ), sep = "-")) %>% ##hex code + letter
+  select(-starts_with("location_"), )
+
+l_dist <- rbind(l_dist_ns %>% select(names(l_dist_hs)), l_dist_hs)
+
+table(l_dist$width_class) 
+# table(l_dist$subtype)
+# table(is.na(l_dist$subtype))
+
+##### line widths ----
+## update missing width classes based on measured widths or average width/class for that subtype
+table(is.na(l_dist$width_class))
+table(is.na(l_dist_2022$width_class))
+
+ggplot(l_dist, aes(width_class, width_m)) + geom_boxplot()
+
+quantile(l_dist_2022[l_dist_2022$width_class == "LOW",]$width_m, c(0, .05, .25, .5, .75, .95, .99, 1), na.rm = T) #1 - 4
+quantile(l_dist_2022[l_dist_2022$width_class == "MED",]$width_m, c(0, .05, .25, .5, .75, .95, 1), na.rm = T) #4-8
+quantile(l_dist_2022[l_dist_2022$width_class == "HIGH",]$width_m, c(0, .05, .25, .5, .75, .95, 1), na.rm = T) # 8+
+
+table(l_dist_2022[is.na(l_dist_2022$width_class) & l_dist_2022$width_m == 0,]$subtype) ## assume 0 width is NA value
+l_dist_2022[is.na(l_dist_2022$width_class) & l_dist_2022$width_m == 0,]$width_m <- NA
+l_dist_2022 <- mutate(l_dist_2022, width_class = ifelse(!is.na(width_class), width_class, ## don't replace existing widths
+                                              ifelse(is.na(width_m), NA, ## can't select by NA, so keep NA
+                                                     ifelse(width_m <4, "LOW", 
+                                                            ifelse(width_m > 8, "HIGH", "MED")))))
+
+table(l_dist[is.na(l_dist$width_class) & l_dist$width_m == 0,]$subtype) ## assume 0 width is NA value
+l_dist <- mutate(l_dist, width_class = ifelse(!is.na(width_class), width_class, ## don't replace existing widths
+                                              ifelse(is.na(width_m), NA, ## can't select by NA, so keep NA
+                                                     ifelse(width_m <4, "LOW", 
+                                                            ifelse(width_m > 8, "HIGH", "MED")))))
+
+
+
+## No NRN data have widths or width classes, assume NRN data are all > 4m wide (e.g. med-high class?)?
+l_dist[is.na(l_dist$width_class) &
+         l_dist$database == "NRNYukonRoadSegments" & 
+         !is.na(l_dist$database),]$width_class <- "HIGH"
+
+##remaining unknowns
+l_dist_tmp <- rbind(l_dist %>% select(subtype, width_class),
+                    l_dist_2022 %>% select(subtype, width_class))
+
+##
+# filter(l_dist_tmp, subtype == "Electric Utility Corridor") %>% group_by(width_class) %>% summarise(n = n()) ##high
+l_dist[is.na(l_dist$width_class) & 
+         l_dist$subtype == "Electric Utility Corridor" & 
+         !is.na(l_dist$subtype),]$width_class <- "HIGH"
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Electric Utility Corridor" & 
+              !is.na(l_dist_2022$subtype),]$width_class <- "HIGH"
+
+## All HS local roads unknown, NS local roads mostly medium
+# filter(l_dist_tmp, subtype == "Local Road") %>% group_by(width_class) %>% summarise(n = n())##most high
+l_dist[is.na(l_dist$width_class) & 
+         l_dist$subtype == "Local Road" &
+         !is.na(l_dist$subtype),]$width_class <- "HIGH"
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Local Road" &
+              !is.na(l_dist_2022$subtype),]$width_class <- "HIGH"
+
+# filter(l_dist_tmp, subtype == "Arterial Road") %>% group_by(width_class) %>% summarise(n = n())
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Arterial Road" &
+              !is.na(l_dist_2022$subtype),]$width_class <- "HIGH"
+try(l_dist[is.na(l_dist$width_class) & 
+              l_dist$subtype == "Arterial Road" &
+              !is.na(l_dist$subtype),]$width_class <- "HIGH")
+
+# filter(l_dist_tmp, subtype == "Access Road") %>% group_by(width_class) %>% summarise(n = n())
+try(l_dist[is.na(l_dist$width_class) & 
+              l_dist$subtype == "Access Road" &
+              !is.na(l_dist$subtype),]$width_class <- "MED")
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Access Road" &
+              !is.na(l_dist_2022$subtype),]$width_class <- "MED"
+
+# filter(l_dist_tmp, subtype == "Unpaved Road") %>% group_by(width_class) %>% summarise(n = n())
+l_dist[is.na(l_dist$width_class) & 
+              l_dist$subtype == "Unpaved Road" &
+              !is.na(l_dist$subtype),]$width_class <- "MED"
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Unpaved Road" &
+              !is.na(l_dist_2022$subtype),]$width_class <- "MED"
+
+# filter(as.data.frame(l_dist_tmp), str_detect(subtype, "Survey")) %>% group_by(width_class) %>% summarise(n = n()) 
+l_dist_2022[is.na(l_dist_2022$width_class) & 
+              str_detect(l_dist_2022$subtype, "Survey") &
+              !is.na(l_dist_2022$subtype),]$width_class <- "MED"
+try(l_dist[is.na(l_dist$width_class) & 
+              str_detect(l_dist$subtype, "Survey") &
+              !is.na(l_dist$subtype),]$width_class <- "MED")
+
+
+filter(l_dist_tmp, subtype == "Trail") %>% group_by(width_class) %>% summarise(n = n())
+try(l_dist[is.na(l_dist$width_class) & 
+         l_dist$subtype == "Trail" &
+              !is.na(l_dist$subtype),]$width_class <- "LOW")
+try(l_dist_2022[is.na(l_dist_2022$width_class) & 
+              l_dist_2022$subtype == "Trail" &
+              !is.na(l_dist_2022$subtype),]$width_class <- "LOW")
+
+##Most HS unknown features are medium width class
+table(filter(l_dist_2022, is.na(width_class)) %>% pull(subtype))
+table(filter(l_dist, is.na(width_class)) %>% pull(subtype))
+
+
+filter(l_dist_tmp, subtype == "Unknown") %>% group_by(width_class) %>% summarise(n = n()) 
+filter(l_dist_tmp, is.na(subtype)) %>% group_by(width_class) %>% summarise(n = n())
+
+l_dist[is.na(l_dist$width_class),]$width_class <- "MED"
+l_dist_2022[is.na(l_dist_2022$width_class),]$width_class <- "MED"
+
+l_dist_2022$width_class <- factor(l_dist_2022$width_class, levels = c("LOW", "MED", "HIGH"), ordered = T)
+l_dist$width_class <- factor(l_dist$width_class, levels = c("LOW", "MED", "HIGH"), ordered = T)
+
+##Select and compare linear distance of YG vs Pat's digitization ----
+
+## summarise disturbance within 1000m buffer of each station
+l.dist.yg <- st_intersection(l_dist_2022, 
+                             sites %>% st_buffer(1000) %>% 
+                               group_by(siteID, stationID) %>% summarise()) ## note: includes 2023 WCS digitization ontop of the May 2022 YG footprint data
+
+l.dist.wcs <- st_intersection(l_dist %>% select(-siteID), 
+                             sites %>% st_buffer(1000) %>% 
+                               group_by(siteID, stationID) %>% summarise()) ## WCSC digitization for sites surveyed in 2017 - 2021, on an older version of the YG layer
+
+##find and compare total length by site
+#reduce number of features
+l.dist.yg <- l.dist.yg %>% group_by(siteID, stationID, width_class, subtype, width_m) %>% summarise()
+l.dist.wcs <- l.dist.wcs %>% group_by(siteID, stationID, width_class, subtype, width_m) %>% summarise()
+
+l.dist.yg$length_yg <- st_length(l.dist.yg)
+l.dist.wcs$length_wcs <- st_length(l.dist.wcs)
+
+## calculate total length of all linear features per site from the May 2022 yg layer vs the 2021 wcsc digitizations
+l.dist.comp <- full_join(st_drop_geometry(l.dist.yg), 
+                         st_drop_geometry(l.dist.wcs)) %>%
+  group_by(siteID) %>% summarise(length_yg = sum(length_yg, na.rm = T),
+                                 length_wcs = sum(length_wcs, na.rm = T)) %>%
+  rowwise() %>% mutate(length = max(c(length_yg, length_wcs), na.rm = T))
+
+## which layer has more disturbance data?
+l.dist.comp <- l.dist.comp %>% mutate(layer = ifelse(length == length_yg, "yg", "wcs")) ## layer is the data source with the most linear features for that site, presumably the most up to date
+
+l.dist <- rbind(l.dist.yg %>% rename(length_m = length_yg) %>% mutate(layer = "yg"),
+                l.dist.wcs %>% rename(length_m = length_wcs) %>% mutate(layer = "wcs")) %>% 
+  right_join(l.dist.comp %>% select(siteID, layer)) ## select rows from right layer
+
+##l.dist: clipped to 1500m buffer, each site has own multilinestring per width_class. 
+
+### reduce subtypes ----
+local.rd <- c("Access Road", "Transportation - Access Road", "Local Road", "Driveway", "Unpaved Road", "Rural - Driveway", "Transportation - Local Road", "Transportation - Access Assumed", "Local / Street", "Access Assumed", "Service Lane") 
+row <- c("Right of Way", "Unknown NRN", "Laneway", "Transportation or Unknown - Right of Way")
+trail <- c("Trail", "Transportation - Trail", "Resource / Recreation")
+cut <- c("Mining or Unknown - Survey / Cutline", "Survey / Cutline - Placer", "Survey / Cutline - Quartz", "Survey / Cutline", "Survey - Cutline" )
+trench <- c("Trench", "Mining - Diversion Channel", "Mining - Trench")
+euc <- c("Electric Utility Corridor", "Utility - Electric Utility Corridor")
+highway <- c("Highway", "Expressway / Highway")
+unk <- c("Unknown", "Mining, Unknown or Utility - Unknown")
+airstrip <- c("Transportation - Airstrip")
+fuelbreak <- c("Forestry - Fuel Break")
+
+l.dist <- l.dist %>% mutate(subtype2 = ifelse(subtype %in% local.rd, "local road",
+                                    ifelse(subtype %in% row, "right of way",
+                                           ifelse(subtype %in% trail, "trail",
+                                                  ifelse(subtype %in% cut, "cutline",
+                                                         ifelse(subtype %in% trench, "trench",
+                                                                ifelse(subtype %in% euc, "electric utility corridor",
+                                                                       ifelse(subtype %in% highway, "highway", ifelse(subtype %in% airstrip, "airstrip", ifelse(subtype %in% fuelbreak, "fuel break", "unknown"))))))))))
+
+filter(l.dist, subtype2 == "unknown") %>% pull(subtype) %>% unique()
+
+l.dist.width <- st_drop_geometry(l.dist) %>% group_by(subtype2) %>% 
+  summarise(width_mn = mean(width_m, na.rm = T), width_med = median(width_m, na.rm = T))
+# what about widths ranges for unknowns? Base this on width class
+st_drop_geometry(l.dist) %>% group_by(width_class) %>% summarise(min = min(width_m, na.rm = T), median = median(width_m, na.rm = T), max = max(width_m, na.rm = T))
+
+##For features with unknown widths, use the median value for that subtype.
+#*note: might be better to use width_med for all analysis, as width_m is ofter unaccurate and variable throughout the feature, and the imagery resolution and thus measurement resolution is low. 
+l.dist <- left_join(l.dist, l.dist.width) %>% 
+  mutate(width_m = ifelse(!(is.na(width_m)), width_m, ## if there is a width, keep it
+                            ifelse(subtype2 != "unknown", width_med, #if it is a known feature subtype, use the median
+                                   ifelse(width_class == "LOW", 3, ifelse(width_class == "MED", 6, 11))))) ## if unknown, use median for the width class
+
+table(l.dist$subtype2, l.dist$width_class) 
+table(l.dist$subtype2, l.dist$width_med) 
+
+l.dist$type <- ifelse(l.dist$subtype2 %in% c("highway", "local road", "right of way"), "Road",
+                      ifelse(l.dist$width_class == "LOW", "Trail", "Cutline")) ## trail and cutline are generalized terms based on subtype2 median widths, but represent a range of subtypes. Non-road narrow and non-road wide are more accurate terms, but its confusing to change now
+table(l.dist$type)
+```
+
+## Linear features to Area polys
+
+There is correlation between surface disturbance and linear denisty.
+This can be reduced by removing the area of linear features from the
+surface disturbance layer.
+
+I'm not sure this has ecological reasoning behind it, as I see the
+effect of linear features as the addition of an edge, whereas there if
+we interpret linear features as an area, I'm not sure why a road should
+be different from bare ground, etc.
+
+It does give us the option of modelling area of surface disturbance with
+area of linear features though.
+
+*Note* I'm using the median width for each subtype2 as measured widths
+are likely highly inaccurate.
+
+```{r}
+## Linear to polygon ----
+## if we buffer linear feature by their widths, this can be removed from disturbance surface area which reduce correlation between surface disturbance and linear density. 
+## Note: recommended to use the median width vs 
+l.dist.p <- st_buffer(l.dist, dist = l.dist$width_med/2, endCapStyle="FLAT") ##width/2 because adding buffer to both sides
+l.dist.p <- l.dist.p %>% group_by(siteID, stationID, type) %>% summarise()
+## remove overlapping areas, where road > cutline > trail
+
+rm(l_dist, l_dist_2022, l_dist_2023, l_dist_a_hs, l_dist_a_ns, l_dist_hs, l_dist_hs2, l_dist_ns, l_nrn_hs, l_nrn_hs2, l_nrn_ns, l.dist.comp, l.dist.wcs, l.dist.yg)
+
+##roads vs habitat poly ----
+##currently roads and disturbance are correlated. The fact that roads are often contained within our disturbance polygons means that roads area is potentially contributing twice (both as a linear feature as well as being captured as area in the disturbance polygon).  
+
+# line_comp <- st_intersection(l.dist.p, hab.poly.site)
+# line_comp$area <- st_area(line_comp)
+# tmp <- line_comp %>% group_by(type, class) %>% summarise(lc.area = sum(area))
+# line_comp1 <- line_comp %>% group_by(type) %>% summarise(lin.area = sum(area)) %>% st_drop_geometry() %>%
+#   left_join(st_drop_geometry(tmp)) %>% mutate(p.area = lc.area/lin.area)
+# ## what 'habitat' do linear features overlie?
+# line_comp1 %>% arrange(desc(p.area)) %>% filter(type == "Road") # 21% woodland, 14% d_Bare, 12% d_Veg, 10% sparce...
+# line_comp1 %>% arrange(desc(p.area)) %>% filter(type == "Cutline") ## Minimal overlap with disturbance (4% veg, 2 % bare), with most being classified as woodland (34%), evergreen forest (20%)
+# line_comp1 %>% arrange(desc(p.area)) %>% filter(type == "Trail") ## Minimal overlap with disturbance (2% veg, <1 % bare), with most being classified as woodland (35%), evergreen forest (34%)
+
+```
+
+## add linear poly to hab poly
+
+remove linear polygons from habitat polygons and combine.
+
+```{r}
+## remove linear disturbance area from habitat poly
+
+names(l.dist.p)
+names(hab.poly.station)
+
+l.dist.p.l <- l.dist.p %>% split(.$stationID)
+hab.poly.l <- hab.poly.station %>% split(.$stationID)
+
+all.equal(names(l.dist.p.l), names(hab.poly.l))
+##not all sites have linear features? 
+
+hab.poly.l <- hab.poly.l[names(l.dist.p.l)]
+
+## remove linear from current habitat poly (includes surface disturbance)
+hab.poly.l <- pmap(list(l.dist.p.l, hab.poly.l), function(disturb, hab.poly){
+  st_difference(hab.poly, st_union(disturb))
+})
+
+## Merge the two layers into a single layer
+hab.poly.l <- pmap(list(l.dist.p.l, hab.poly.l), function(disturb, hp){
+  hp <- select(hp, siteID, stationID, class, layer)
+  disturb <- disturb %>% 
+    mutate(class = paste0("d_", type), layer = "YGfootprint_CWS_update") %>%
+    select(names(hp))
+  bind_rows(list(disturb, hp))
+})
+
+ggplot(hab.poly.l$`MS12-2`, aes(fill = class)) + geom_sf(alpha = .5)
+
+## combine with sites without linear features that were removed from hab.poly.l
+hab.poly.station <- bind_rows(bind_rows(hab.poly.l), 
+                 hab.poly.station %>% filter(!stationID %in% names(hab.poly.l)))
+
+saveRDS(hab.poly.station, file.path("E:/Archive",pipeline, "store", "lcmerge_stat_linear.RDS"))
+```
+
+# Waterways
+
+Canvec linear flow/waterways contains lines that could be used to
+calculate linear density of creeks. waterways Note: wider rivers and
+lakes are included as polygon features in a seperate layer linear flow:
+flow direction, including wide rivers and lakes. Best option for
+calculating linear density of water. *Note*: I preprocessed this layer
+in ArcGIS, clipping out the study area and unioning it to reduce size
+and computation time.
+
+Stream order Stream orders were derived by mapping a new stream network
+created in ArcGIS Pro. The stream network was based on the Canadian
+Digital Elevation Model (Natural Resources Canada 2013) which was filled
+then used to calculate a flow direction raster using the flow direction
+tool. The flow accumulation tool was used to draw a stream network based
+on the flow direction raster, and areas with a flow accumulation greater
+than 1000 were classified as a stream. Stream order tool was then used
+to assign stream order based on the Strahler method.
+
+```{r waterways}
+## canvec waterways ----
+
+fgdb <- file.path(gis_dir, "canvec_50k_YT_Hydro.gdb")
+waterway <- st_as_sf(vect(fgdb, layer="water_linear_flow_1"))
+bbox <- st_bbox(c(xmin = -141.0,
+                  ymin = 63.0,    
+                  xmax = -135.5,  
+                  ymax = 65),crs=st_crs(waterway))
+
+bbox_sf <- st_as_sfc(bbox)
+
+tictoc::tic()
+waterway <- st_intersection(waterway, bbox_sf)
+tictoc::toc()
+## clips to just lines around sites, but no attribute info
+tictoc::tic()
+waterway <- st_intersection(sites %>% st_buffer(1500) %>% 
+                               st_union() %>% 
+                               st_transform(crs = st_crs(waterway)),
+                             waterway)
+tictoc::toc()
+## add site and station IDs so we can filter 
+waterway <- st_intersection(st_as_sf(waterway), 
+                             sites %>% st_buffer(1500) %>% 
+                               group_by(siteID, stationID) %>% summarise() %>% 
+                              st_transform(crs = st_crs(waterway)))
+
+##Stream order ----
+
+stream_order <- st_read(file.path(gis_dir, "StreamOrder/StreamOrder_CDEMFill1000_shp.shp")) ## created in arcGIS using CDEM elevation raster to calculate flow accumulation and then stream order. 
+stream_order <- stream_order %>% rename(order = grid_code) %>% 
+  group_by(order) %>% summarize()
+
+stream_order <- st_intersection(stream_order, sites %>% st_buffer(1500) %>% 
+                               st_union() %>% 
+                               st_transform(crs = st_crs(stream_order)))
+
+stream_order <- st_intersection(stream_order, 
+                             sites %>% st_buffer(1500) %>% 
+                               group_by(siteID, stationID) %>% summarise() %>% 
+                               st_transform(crs = st_crs(stream_order)))
+```
+
+#CLIMATE See daymet_download.R.\
+I chose to work with a 5 year average (\~ duration of territory
+occupancy) including year of survey. I focused on June values or annual
+summaries.
+
+It still doesn't seem like the best data, as there are few weather
+stations to interpolate from. Weather reanalysis data (e.g. era5) might
+be a better option, but the scale is too coarse and I don't trust myself
+to properly krig/resample to reduce the resolution in a montaine area.
+
+```{r}
+daymet <- readRDS("0_data/daymet_5yr.rds") ## 5 year average from june (or last snow in the year)
+
+daymet <- select(daymet, siteID, year, starts_with("mn_"))
+
+```
+
+# Habitat summary
+
+Calculate the proportion coverage of each major habitat type in the
+habitat raster. Also calculate a total disturbance layer (all
+disturbance types combined. )
+
+```{r hab sum - nasa 1}
+
+## Decide whether we are using the habitat data with or without polygonized linear features. 
+hab.poly.station <- readRDS(file.path("E:/Archive",pipeline, "store", "lcmerge_stat.RDS")) ## without linear polygons
+# hab.poly.station <- readRDS(file.path(pipeline, "store", "lcmerge_stat_linear.RDS")) ## with linear polygons
+wetland.station <- readRDS(file.path("E:/Archive",pipeline, "store", "wetland_station.RDS")) 
+
+## site ID variables
+site.sum <- sites %>% st_drop_geometry() %>% 
+  select(siteID, organization = org, year, wetland.layer) %>% 
+  distinct() %>% 
+  group_by(siteID, organization, year) %>% 
+  summarise(wetland.layer = sum(!wetland.layer) == 0) %>% ## if one station is missiing wetland layer, this site will be false 
+  ungroup()
+
+# ## surface area----
+## area per polygon
+hab.poly.station$area <- st_area(hab.poly.station)
+wetland.station$area <- st_area(wetland.station)
+
+## calculate %cover for each station using a range of buffers. 
+hab.poly.site.l <- hab.poly.station %>% split(.$stationID)
+wetland.site.l <- wetland.station %>% split(.$stationID)
+sites.l <- split(sites, f = sites$stationID)[names(hab.poly.site.l)]
+
+all.equal(names(sites.l), names(hab.poly.site.l))
+
+  
+buff.v <- c(150, 250, 500, 750, 1000)  ## can't go beyon 1000m because 2021 data digitization stoped at 1.5k from site centroid (~1k from the corner sites)
+# buff.v <- c(150, 1000)  ## smallest test
+
+##creates a list where each element is a different buffer 
+hab.sum.buff <- map(buff.v, function(buff) {
+ ##for buffer i, crop habitat polygons around each site
+hab.poly.site.buff.i <- pmap(list(sites.l, hab.poly.site.l),
+                          function(site, poly){
+                            site <- st_buffer(site, dist = buff) %>%
+                              st_union() %>% st_transform(crs = st_crs(poly))
+                            st_intersection(poly, site)
+                          }) 
+#bind all stations together
+hab.poly.site.buff.i <- bind_rows(hab.poly.site.buff.i)
+hab.poly.site.buff.i$area <- hab.poly.site.buff.i %>% st_area()
+## calculate the total area per class for that station&buffer
+hab.sum.buff.i <- st_drop_geometry(hab.poly.site.buff.i) %>% group_by(siteID, stationID, class) %>% summarise(area = sum(area))
+## calculate % cover of each habitat class per station&buffer, join station data together as a df for that buffer
+hab.sum.buff.i <- hab.sum.buff.i %>% group_by(siteID, stationID) %>% 
+  summarise(site.area = sum(area)) %>% left_join(hab.sum.buff.i) %>% 
+  mutate(prop = as.numeric(area/site.area)) %>%
+  select(-area) %>%
+  pivot_wider(id_cols = c(siteID, stationID, site.area), names_from = class, 
+              values_from = prop, values_fill = 0) %>% 
+  mutate(buffer = buff)
+hab.sum.buff.i
+})
+
+#join different buffers, and add to site ID info
+hab.sum <- right_join(site.sum, list_rbind(hab.sum.buff))
+hab.sum$d_surface <- rowSums(hab.sum %>% select(d_pBare, d_pVeg, d_pWater))
+
+## if using hab polygons
+#hab.sum$d_linear <- rowSums(hab.sum %>% select(d_Road, d_Trail, d_Cutline))
+#hab.sum$d_all <- rowSums(hab.sum %>% select(d_Road, d_Trail, d_Cutline,d_pBare, d_pVeg, d_pWater))
+
+all.equal(names(sites.l), names(wetland.site.l)) ## not all sites have wetlands
+sites2.l <- sites.l[names(wetland.site.l)]
+
+### wetland area ----
+## repeat steps used for hab poly with the wetland polys
+
+gc()
+
+
+tictoc::tic()
+hab.buff <- map(buff.v, function(buff) {
+  hab.poly.site.buff.i <- pmap(list(sites2.l, wetland.site.l),
+                            function(site, poly){
+                              site <- st_buffer(site, dist = buff) %>%
+                                st_union() %>% st_transform(crs = st_crs(poly))
+                              st_intersection(poly, site)
+                            }) 
+  hab.poly.site.buff.i <- bind_rows(hab.poly.site.buff.i)
+  hab.poly.site.buff.i <- hab.poly.site.buff.i %>% group_by(siteID, stationID, class2) %>% summarise()
+  
+  hab.poly.site.buff.i$area <- hab.poly.site.buff.i %>% st_area()
+  hab.sum.buff.i <- st_drop_geometry(hab.poly.site.buff.i) %>% group_by(siteID, stationID, class2) %>% 
+    summarise(area = sum(area))
+  
+  
+  hab.sum.buff.i <- left_join(hab.sum.buff.i, hab.sum %>% filter(buffer == buff) %>% 
+                                select(stationID, site.area)) %>%
+    mutate(prop = as.numeric(area/site.area)) %>%
+    select(-area) %>%distinct()%>%
+    pivot_wider(id_cols = c(siteID, stationID, site.area), names_from = class2, 
+                values_from = prop, values_fill = 0) %>% 
+    mutate(buffer = buff)
+  hab.sum.buff.i
+})
+tictoc::toc()
+
+hab.sum <- left_join(hab.sum, list_rbind(hab.buff))
+
+### add elevation ----
+hab.sum <- left_join(hab.sum, elev_mn %>% rename(elev = mean))
+ hab.sum <- left_join(hab.sum, bz_sum %>% select(siteID, hc_borealLow = P.Boreal_Low, hc_borealSubalpine = P.Boreal_Subalpine))
+
+##add daymet weather
+hab.sum <- left_join(hab.sum, daymet) 
+
+```
+
+## Linear features
+
+```{r hab sum linear 1}
+
+l.dist.l <- l.dist %>% split(.$stationID) ##Not all sites overlap linear features, so those sites will be missing from this data set
+
+sites.l <- sites.l[names(l.dist.l)] 
+
+## If using linear polyons ----
+# hab.sum.lp.buff <- map(buff.v, function(buff) {
+#   l.dist.buff.i <- pmap(list(sites.l, l.perim.l),
+#                             function(site, poly){
+#                               site <- st_buffer(site, dist = buff) %>%
+#                                 st_transform(crs = st_crs(poly))
+#                               st_intersection(poly, site)
+#                             }) 
+#   l.dist.buff.i <- bind_rows(l.dist.buff.i)
+#   l.dist.buff.i$perimeter <- l.dist.buff.i[st_geometry_type(l.dist.buff.i) %in% c("LINESTRING","MULTILINESTRING"),] %>% st_length() %>% as.numeric()
+#   
+#    st_drop_geometry(l.dist.buff.i) %>% 
+#     group_by(siteID, stationID, class) %>%
+#     summarise(perimeter = sum(perimeter)) %>% 
+#     mutate(type = gsub("d_", "", tolower(class))) %>%
+#     pivot_wider(id_cols = c(siteID, stationID),
+#                 names_from = type, 
+#                 names_glue = "d_perim_{type}", 
+#                 values_from = perimeter,
+#                 values_fill = 0) %>% mutate(buffer = buff) 
+#   # %>% 
+#   #   select(names(hab.sum.lf)) %>%
+#   #   rbind(hab.sum.lf)##  this would rbind with a previous
+# })
+
+
+hab.sum.lf.buff <- map(buff.v, function(buff) {
+  l.dist.buff.i <- pmap(list(sites.l, l.dist.l),
+                            function(site, poly){
+                              site <- st_buffer(site, dist = buff) %>%
+                                st_union() %>% st_transform(crs = st_crs(poly))
+                              st_intersection(poly, site)
+                            }) 
+  l.dist.buff.i <- bind_rows(l.dist.buff.i)
+  l.dist.buff.i$length <- l.dist.buff.i[st_geometry_type(l.dist.buff.i) %in% c("LINESTRING","MULTILINESTRING"),] %>% st_length()
+  
+   st_drop_geometry(l.dist.buff.i) %>% 
+    group_by(siteID, stationID, type) %>%
+    summarise(length = sum(length)) %>% 
+    left_join(ungroup(hab.sum) %>% filter(buffer == buff) %>% select(siteID, stationID, site.area)) %>%
+    mutate(density = as.numeric(length/site.area),
+           type = substring(tolower(type), 1, 1)) %>%distinct()%>%
+    pivot_wider(id_cols = c(siteID, stationID),
+                names_from = type, 
+                names_glue = "d_lden_{type}", 
+                values_from = density,
+                values_fill = 0) %>% mutate(buffer = buff) 
+
+})
+
+hab.sum.lf <- list_rbind(hab.sum.lf.buff)
+table(hab.sum.lf$buffer) ## missing rows if there are no linear features that overlap 
+
+## If using linear features
+# hab.sum.lp <- list_rbind(hab.sum.lp.buff)
+# hab.sum.lf <- left_join(hab.sum.lf, hab.sum.lp)
+
+
+## waterways ----
+waterway.l <- waterway %>% split(.$stationID) 
+sites.l <- split(sites, f = sites$stationID)[names(waterway.l)]
+
+water.den <- map(buff.v, function(buff) {
+
+  waterway.buff.i <- pmap(list(sites.l, waterway.l),
+                            function(site, poly){
+                              site <- st_buffer(site, dist = buff) %>%
+                                st_union() %>% st_transform(crs = st_crs(poly))
+                              st_intersection(poly, site)
+                            }) 
+  waterway.buff.i <- bind_rows(waterway.buff.i)
+  waterway.buff.i$length <- waterway.buff.i %>% st_length()
+  st_drop_geometry(waterway.buff.i) %>% 
+    group_by(siteID, stationID) %>%
+    summarise(length = sum(length)) %>% 
+    left_join(filter(hab.sum, buffer == buff) %>% select(siteID, stationID, buffer, site.area)) %>%
+    mutate(wden = as.numeric(length/site.area)) %>% select(siteID, stationID, buffer, wden) %>% 
+    mutate(buffer = buff) 
+})
+
+water.den <- list_rbind(water.den)
+
+
+## stream_order ----
+stream_order.l <- stream_order %>% split(.$stationID) 
+sites.l <- split(sites, f = sites$stationID)[names(stream_order.l)]
+
+stream_order.sum <- map(buff.v, function(buff) {
+  stream_order.buff.i <- pmap(list(sites.l, stream_order.l),
+                            function(site, poly){
+                              site <- st_buffer(site, dist = buff) %>%
+                                st_union() %>% st_transform(crs = st_crs(poly))
+                              st_intersection(poly, site)
+                            }) 
+  stream_order.buff.i <- bind_rows(stream_order.buff.i)
+  stream_order.buff.i$length <- stream_order.buff.i[st_geometry_type(stream_order.buff.i) %in% 
+                                          c("LINESTRING","MULTILINESTRING"),] %>% st_length()
+  max.order <- max(unique(stream_order.buff.i$order))
+  stream_order.sum.i <- st_drop_geometry(stream_order.buff.i) %>% 
+  group_by(siteID, stationID, order) %>%
+  summarise(length = sum(length)) %>% 
+  left_join(filter(hab.sum, buffer == buff) %>% select(siteID, stationID, buffer, site.area)) %>%
+  mutate(density = as.numeric(length/site.area)) %>% distinct()%>%
+  pivot_wider(id_cols = c(siteID, stationID, buffer), 
+              names_from = order, 
+              names_glue = "wden_{order}", 
+              values_from = density,
+              values_fill = 0) 
+  ## the highest order stream within 1000m is 8. Smaller buffers might miss these higher order streams. 
+  
+  if(max.order < 8){
+
+    x <- paste0("wden_", seq(max.order + 1, 8, 1))
+    
+    for(i in x) {
+      stream_order.sum.i <- mutate(stream_order.sum.i, "{i}" := 0)
+    }
+        
+    }
+  
+   
+  stream_order.sum.i %>% mutate(buffer = buff) 
+})
+
+stream_order.sum <- list_rbind(stream_order.sum)
+table(stream_order.sum$buffer)
+
+water.den <- full_join(water.den, stream_order.sum)
+
+hab.sum <- full_join(hab.sum, water.den) %>% full_join(hab.sum.lf) %>% full_join(hab.sum.lf)
+
+table(hab.sum$buffer) ## all equal now - need to fill missing values with 0
+table(hab.sum$buffer, is.na(hab.sum$wden_5))
+
+```
+
+# Tidy up!
+
+```{r habsum tidy}
+names(hab.sum)
+hab.sum$site.area <- as.numeric(hab.sum$site.area)
+hab.sum <- hab.sum %>% rename_with(\(x) str_replace(x, pattern = "H_", replacement = "h_"), starts_with('H_'))
+hab.sum$wden_high <- rowSums(hab.sum %>% select(wden_6, wden_7, wden_8))
+hab.sum <- hab.sum %>% select(-wden_6, -wden_7, -wden_8, - site.area) ## low rep of high order streams, so group into a single class
+
+##Fill sites without a given hab class with 0
+hab.sum[, !(names(hab.sum) %in% c("elev",  "mn_temp", "total_precip", "last_snow", "buffer", "site.area"))][is.na(hab.sum[, !(names(hab.sum) %in% c("elev",  "mn_temp", "total_precip", "last_snow", "buffer", "site.area"))])] <- 0
+##these columns NAs represent missing data, not zero coverage
+
+```
+
+### save
+
+```{r}
+saveRDS(hab.sum, file.path("E:/Archive",pipeline, "out", "hab_sum.RDS")) ## station level habitat summary
+
+###site-level ----
+# average across stations proportional to the number of visits at that station. 
+# Should be reflective of relative effort for most sites, sites mixing ARU and PC perhaps not (over emphasis on ARU stations vs PC stations)
+
+hab.sum <- read_rds("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum.RDS")
+visits <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
+
+visits$stationID <- paste(visits$siteID, visits$station, sep = "-")
+
+hab.sum2 <- left_join(hab.sum, st_drop_geometry(visits), relationship = "many-to-many") ## many to many bc multiple buffers in hab.sum and multiple visits in visits
+
+## average across stations, regardless of # of visits
+hab.sum <- hab.sum %>% group_by(organization, siteID, wetland.layer, year, buffer) %>%
+  summarise(across(c(starts_with("h_"), starts_with("d_"), elev, starts_with("mn_"), 
+                   starts_with("wden")), mean)) 
+
+## Proportional to the number of visits, not the actual area. 
+hab.sum2 <- hab.sum2 %>% group_by(organization, siteID, wetland.layer, year, buffer) %>%
+  summarise(across(c(starts_with("h_"), starts_with("d_"), elev, starts_with("mn_"), 
+                   starts_with("wden")), mean)) 
+
+#add site centroid
+sitesC <- sites %>% group_by(siteID) %>% summarise() %>%
+  st_centroid() %>% select(siteID)
+sitesC$lon <- st_coordinates(sitesC)[,1]
+sitesC$lat <- st_coordinates(sitesC)[,2]
+sitesC$EPSG <- "EPSG:3579"
+
+sitesC$lon_wgs84 <- st_coordinates(st_transform(sitesC, crs = "EPSG:4326"))[,1]
+sitesC$lat_wgs84 <- st_coordinates(st_transform(sitesC, crs = "EPSG:4326"))[,2]
+
+hab.sum <- left_join(hab.sum, st_drop_geometry(sitesC))
+hab.sum2 <- left_join(hab.sum2, st_drop_geometry(sitesC))
+
+saveRDS(hab.sum, file.path("E:/Archive",pipeline, "out", "hab_sum_site.RDS"))
+# saveRDS(hab.sum2, file.path(pipeline, "out", "hab_sum_site.RDS"))
+
+```

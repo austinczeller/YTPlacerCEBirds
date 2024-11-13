@@ -1,0 +1,1050 @@
+---
+title: "Count Data Processing"
+author: "Morgan Brown & Austin Zeller"
+date: '2022-03-23'
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE)
+
+NAME <- '1_CountDataProcessing' ## Name of the R file goes here (without the file extension!)
+PROJECT <- 'Archive' ## Project folder
+# PROJECT_DIR <- 'C:/Users/jbrown1/surfdrive/WCSC' ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes (i.e. 
+PROJECT_DIR <- "E:/CE_analysis"
+
+##Set working directory
+#setwd(file.path(PROJECT_DIR, PROJECT))
+knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
+
+# Set  up pipeline folder if missing
+### The code below will automatically create a pipeline folder for this code file if it does not exist.
+
+pipeline <- file.path('2_pipeline', NAME)
+
+if (!dir.exists(pipeline)) {
+  dir.create(pipeline)
+  for (folder in c('out', 'store', 'tmp')){
+    dir.create(file.path(pipeline, folder))
+  }
+}
+# 
+# ##Shannon index - all species are represented in a sample, and they are randomly sampled
+shannon.index <- function(n) {
+  ##n is a vector of abundance per species at a site
+  N = sum(n)
+  p.i <- n/N
+  -sum(p.i * log(p.i))
+}
+# ## Simpson index: more dominant species are given more weight, so rare species do not affect diversity
+# simpson.index <- function(n) { 
+#   ##n is a vector of abundance per species at a site
+#   N = sum(n)
+#   p.i <- n/N
+#   1/sum(p.i^2)
+# }
+# 
+# random.rows <- function(df, size = 10){
+#   ##randomly select rows from a dataframe
+#   l <- dim(df)[1]
+#   df[sample(1:l, size),]
+# }
+
+# Load Packages ----
+library(tidyverse)
+library(lubridate)
+library(sf) ##spatial features
+library(readxl)
+library(biscale)
+#library(rgdal) ##r geospatial data abstraction library
+# library(raster)
+library(terra)
+# library(stars)
+library(cowplot)
+library(ggbreak)
+library(wildrtrax)
+select <- dplyr::select
+theme_set(theme_classic())
+```
+
+## Load Wildtrax Data
+
+-   ARU data from WCS and ECCC are downloaded from directly from
+    wildtrax.
+
+```{r Wildtrax WCS1}
+Sys.setenv(WT_USERNAME = 'austinzeller@rocketmail.com', WT_PASSWORD = 'Ke$ha50az') ## enter your own username and password
+wt_auth()
+
+my_projects <- wt_get_download_summary(sensor_id = 'ARU')
+filter(my_projects, organization %in% c("WCSC", "CWS-NOR"))
+project_ids <- c(577,2078,2782,446) ## ADD 446 back once i get access!!!
+#THese are the project with data from our region of interest
+proj_names <- filter(my_projects, project_id %in% project_ids) %>% pull(project)
+
+aru <- map(project_ids, \(id) wt_download_report(project_id = id, sensor_id = "ARU", report = c("main"), weather_cols = F))
+
+write_rds(aru, file.path('E:/Archive/',pipeline, "tmp", "wt_2024_11_12.RDS")) ## store a backup copy of the download file so download can be skipped in future
+aru <- read_rds(file.path('E:/Archive/',pipeline, "tmp", "wt_2024_11_12.RDS"))
+
+# aru <- map(aru, \(df) wt_tidy_species(df, remove = c("mammal", "amphibian", "abiotic", 
+#                            "insect")) %>% ## keeps only bird species
+#              wt_replace_tmtt()) ## estimate count when "too many to count" was used
+## functions appear broken
+
+aru <- map(aru, \(df) filter(df, aru_task_status == "Transcribed" & observer != "Patrice Mathieu")) ## remove badweather recordings & malfunctions based on task status
+## remove recordings transcribed by Patrice due to data quality concerns
+
+
+
+names(aru) <- proj_names
+```
+
+Currently recording metadata entered by transcribers isn't available via
+direct download. Instead, task data were manually downloaded from
+wildtrax and are read in from .csvs.
+
+```{r}
+##Noise data isn't included in ARU reports that can be downloaded from wildtrax. Need to manually download tasks from website (open project > manage > download tasks).
+aru_noise <- rbind(read_csv("E:/Archive/0_data/SB2023_Tasks_20240219.csv"), read_csv("E:/Archive/0_data/SB2021_Tasks_20240219.csv"), read_csv("E:/Archive/0_data/South Beringia Priority Place Cumulative Effects 2024_Tasks_202423.csv"), read_csv("E:/Archive/0_data/CWS1718_Tasks_20231207.csv"))
+
+## Extract noise levels and summarise into a single observed noise variable by selecting the highest noise level across 'industry' and 'other' noise types, then join with the ARU transcription data. 
+
+aru_noise <- aru_noise %>% filter(status=="Transcribed") %>%
+  mutate(recordingDate = as.character(recordingDate), 
+         task_duration = paste0(taskLength, "s"),
+         industryNoise = factor(industryNoise, c("Unk", "None","Light","Moderate","Heavy"), ordered = T),
+         otherNoise = factor(otherNoise, c("Unk","None","Light","Moderate","Heavy"), ordered = T)) %>%
+  rowwise %>% mutate(obsNoise = max(industryNoise, otherNoise, na.rm = T)) %>%
+  select(location, task_id = internal_task_id, recording_date_time = recordingDate, observer = transcriber, task_method = method, obsNoise) %>%mutate(recording_date_time=ymd_hms(recording_date_time))%>% ungroup()
+
+aru <- map(aru, \(df) df %>% left_join(aru_noise))
+```
+
+Clean up the ARU data
+
+```{r}
+## one recording has wrong time stamp
+table(str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4)) 
+str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4) <- "2023"
+
+## seperate station number from site ID
+aru[[1]] <- aru[[1]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+                      station = str_split_i(location, "-", 2))
+aru[[2]] <- aru[[2]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+                      station = str_split_i(location, "-", 2))
+aru[[3]] <- aru[[3]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+                      station = str_split_i(location, "-", 2))
+aru[[4]] <- aru[[4]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = paste(str_split_i(location, "-", 3), 
+                                              substring(str_split_i(location, "-", 4), 1, 1), sep = "-"),
+                      station = substring(str_split_i(location, "-", 4), 2))
+
+aru <- lapply(aru, function(df) {
+    df$individual_count <- as.numeric(df$individual_count)
+    return(df)
+})
+
+aru <- bind_rows(aru)
+
+aru <- aru %>% select(org = organization, locID = location_id, site, station, lat = latitude, lon =  longitude,
+                      recID = recording_id, taskID = task_id, recording_date = recording_date_time, 
+                      dur = task_duration, task_comments, obs = observer_id, 
+                      species_code, species_common_name, tagID = tag_id, 
+                      count = individual_count, voc = vocalization, detection_time, obsNoise) %>%
+  mutate(recording_date = ymd_hms(recording_date, tz = "Canada/Yukon"), 
+         dur = as.numeric(substr(dur,1,nchar(dur)-1)))
+
+## remove duplicated counts (same recording, two blind transcribers)
+tmp <- aru %>% select(site, station, recording_date, taskID, obs) %>% distinct() %>% 
+  select(-obs, -taskID) %>%
+  duplicated() ## is row duplicated?
+tmp2 <- aru %>% select(site, station, recording_date, taskID, obs) %>% distinct() ## need a matching dataset to filter
+table(tmp2[tmp,]$obs) ## approximately random which observer is dropped
+aru <- anti_join(aru, tmp2[tmp,]) ## drop duplicates from aru
+
+##aru includes sites with no detections (species_code none)
+# filter(aru, species_code == "NONE")
+record.sched <- aru %>% select(site, station, recording_date, dur) %>% distinct() 
+
+## Remove non-avian detections
+species <- wt_get_species() ## download key to species codes
+aru <- anti_join(aru, filter(species, species_class != "AVES" & !(species_common_name %in% c("NONE", "Unidentified"))))
+
+## if abundance > 1, a flock was heard at that time stamp
+#TMTT (too many to count)
+aru %>% filter(count == "TMTT") %>% select(species_code, species_common_name) %>% distinct()
+
+table(aru %>% group_by(locID, species_code) %>% summarise(n.of.ind = n()) %>% filter(species_code %in% c("WWCR", "BANS", "CANG", "VGSW")) %>% pull(species_code),
+      aru %>% group_by(locID, species_code) %>% summarise(n.of.ind = n()) %>% filter(species_code %in% c("WWCR", "BANS", "CANG", "VGSW")) %>% pull(n.of.ind))
+
+##Most <5, so assume TTMT = 5?
+## set abundance for TMTT = 5. 
+aru <- aru %>% mutate(count = as.numeric(ifelse(count == "TMTT", 5, count)))
+
+
+aru.sites <- unique(aru$siteID)
+aru$ts <- aru$recording_date
+aru$voc <- factor(aru$voc) #call, song, non-vocal
+
+aru <- aru %>%
+  select(organization = org, siteID = site, station, lat_wt = lat, lon_wt = lon,
+         ts, species_code, species_english_name = species_common_name, 
+         species_individual_name = tagID, detection_time, abundance = count, dur, observer = obs, obsNoise)
+
+##ceiling to match with PC minute intervals if trying to pair.
+##Note recommended, because the PC data with paired recordings isn't very good....
+aru$tag_min <- ceiling(aru$detection_time/60)
+aru[aru$tag_min == 0 & !is.na(aru$tag_min), "tag_min"] <- 1 ## these tags started at time 0:00, so should be in first minute.
+
+##wildtrax updated GRAJ to CAJA before tag validation, so now mixed
+aru[aru$species_code == "GRAJ",]$species_english_name <- "Canada Jay"
+aru[aru$species_code == "GRAJ",]$species_code <- "CAJA"
+
+table(aru$station)
+aru <- aru %>% mutate(station = as.numeric(gsub("\\D", "", station)))
+
+```
+
+## Create a data from of all survey locations
+
+# Load point counts
+
+This code includes loading WCSC point count data form 2021, which I
+don't recommend using. Point count data from 2023 has not been uploaded
+as we're focusing on ARU transcription when available. Data by Chris
+Coxson should be of good quality.
+
+## Station coordinates
+
+All ARU data have lat/lon from wildtrax.
+
+Original 2021 WCS field data are stored in
+`~/2021Data/Methodology/EW2021-JUL-21_DataIntake.xlsx`. Some stations
+had incorrect lat/lon information (well away from a 300x300m grid),
+usually those that had to be moved during based on field conditions. I
+corrected these coordinates by estimating the actual location based on a
+300x300m grid. The corrected station information is saved in
+`0_data/EW2021-Sites-correctedmjb.csv`. Coordinates that I adjusted are
+indicated in the column Coord_adjust_mjb.
+
+ECCC point count data and station information is stored in
+"0_data/CWS_WH_LANDBIRD_PCS_2017-2019.csv", and lat/lon positions stored
+in ARU data. There are 92 pair point count stations, 877 PC only
+stations, and 160 ARU only stations, covering most of the Yukon. SOme PC
+sites had incorrect coordinates, which should be replaced by those in
+"0_data/CWS_CoordCor.csv"
+
+```{r PC}
+## Site metadata
+sites2021 <- read_csv("E:/Archive/0_data/EW2021-Sites-correctedmjb.csv")
+names(sites2021) <- c("siteID", "station", "method", "date", "time", "survey_type", "UTM_zone", "easting", "northing", "coord_cor", "observer",
+                      "ARU_id", "SD_A", "SD_B", "loc_move", "prefix_correct", "pickup_date", "pickup_time", "temp", "wind", "precip",
+                      "cloud", "comments")
+sites2021$time <- dmy_hms(paste(sites2021$date, hour(sites2021$time),
+                                minute(sites2021$time), second(sites2021$time)),
+                          tz = "Canada/Yukon")
+sites2021$pickup_time <- dmy_hms(paste(sites2021$pickup_date, sites2021$pickup_time),
+                                   tz = "Canada/Yukon")
+
+
+###ECCC data PC data ----
+eccc <- read_csv("E:/Archive/0_data/CWS_WH_LANDBIRD_PCS_2017-2019.csv")
+###some coordinates were incorrect in the database when provided. 
+##correct coordinates
+coord.cor <- read_csv("E:/Archive/0_data/CWS_CoordCor.csv") ##provided by logan (feb 2023)
+coord.cor <- select(coord.cor, loc_name, lat, lon) %>% distinct()
+
+eccc <-left_join(eccc, coord.cor)
+eccc <- eccc %>% mutate(lon = ifelse(is.na(lon), location.longitude, lon),
+                        lat = ifelse(is.na(lat), location.latitude, lat)) ## if there isn't a match in coord.cor, ie. lon = na, use original lat/lon, i.e. location.longitude, otherwise use those from coord.cor. 
+
+## seperate site IDs from station numbers and drop gridcell identifiers.  
+eccc <-  eccc %>% separate(col = loc_name, into = c("location_3", "location_4"), sep = "-") %>% ##splits into 6 number code + letter/number
+  mutate(station = str_extract(location_4, "[0-9]+" ),
+         siteID = paste(location_3, str_extract(location_4, "[A-Z]+" ), sep = "-")) %>% ## now should match with ARU site.station
+  select(-location_3, -location_4)
+
+##wildtrax lat/longs
+sites <- aru %>% select(siteID, station, lat = lat_wt, lon = lon_wt, organization) %>%   
+  filter(!is.na(lat)) %>% distinct() %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = st_crs(4269)) %>% ##EPSG for NAD83 datum
+  st_transform(crs = st_crs(3579)) ## EPSG for NAD83(CSRS) / Yukon Albers
+
+sitesHistoricPC <- eccc %>% select(siteID, station, lat, lon) %>% 
+  filter(!is.na(lat)) %>% distinct() %>% 
+  st_as_sf(coords = c("lon", "lat"), crs = st_crs(4269)) %>% ##EPSG for NAD83 datum
+  st_transform(crs = st_crs(3579)) ## EPSG for NAD83(CSRS) / Yukon Albers
+#year(sitesHistoric$time_pc)
+sitesHistoricPC$station <- as.numeric(sitesHistoricPC$station)
+##still includes areas outside of SB
+# dim(semi_join(as.data.frame(sitesHistoricPC) %>% select(siteID, station), as.data.frame(sitesHistoricARU)%>% select(siteID, station))) ##92 paired ARU/PC stations
+# dim(anti_join(as.data.frame(sitesHistoricPC) %>% select(siteID, station), as.data.frame(sitesHistoricARU)%>% select(siteID, station))) ##877 PC stations not in ARU data
+# dim(anti_join(as.data.frame(sitesHistoricARU)%>% select(siteID, station), as.data.frame(sitesHistoricPC) %>% select(siteID, station))) ##161 aru station not in the PC data
+
+## some cws sites had both PC and ARUs, but these weren't paired in time
+cws.pc.sites <- pull(sitesHistoricPC, siteID) %>% unique()
+cws.wt.sites <- filter(sites, organization != "WCSC") %>% pull(siteID) %>% unique()
+dup.sites <- c(cws.pc.sites, cws.wt.sites)[duplicated(c(cws.pc.sites, cws.wt.sites))]
+
+sites <- rbind(sites %>% filter(!(siteID %in% dup.sites)) , 
+               sitesHistoricPC %>% mutate(organization = "CWS-NOR")) ## use lat lon from pointcount data in these cases
+
+sites<- sites %>% mutate(organization = ifelse(organization == "WCSC", "WCS", "ECCC"))
+
+##Remove BBS routes
+sites <- filter(sites, !siteID %in% c("Dane -A", "Dane -B", "Dane -S", "Quill -A",  "Quill -S"))
+
+## Limit ECCC sites to those within reasonable latitudinal range to disturbance gradient data (WCSC)
+## latitudinal cut of: 61deg latitude
+
+sites <- st_crop(sites, xmin = 59945.54, ymin = 731646.547, xmax = 496776.7, ymax = 1306089)
+sites$station <- as.numeric(sites$station)
+
+
+```
+
+## Visits
+
+Create a dataset documenting visits to each station. Observer IDs could
+also potentially be added here. SiteID and station links it to the sites
+dataframe.
+
+```{r visits}
+visits <- aru %>% select(siteID, station, ts , dur, obsNoise, observer) %>% distinct() %>% 
+  mutate(dur_min = dur/60,  method = "ARU", observer = as.character(observer))
+
+##obsID: 527 = CWS, 918 = avery,  2643 = chris, 1136 = Pat
+
+sites2021 <- left_join(sites2021, aru %>% select(siteID, station, time = ts, obsNoise)) ### all 2021 PCs have obsNoise from ARUs (all paired. )
+
+visits <- rbind(visits,
+                sites2021 %>% filter(method == "PC") %>% 
+                  select(siteID, station, ts = time, obsNoise, observer) %>%
+                  distinct() %>%
+                  mutate(method = "PC", dur_min = 10, dur = 600) 
+                %>% select(names(visits)))
+eccc <- left_join(eccc, data.frame(noise = 0:3, obsNoise = factor(c("None","Light","Moderate","Heavy"), 
+                                                                  levels = c("Unk", "None","Light","Moderate","Heavy"), 
+                                                                  ordered = T)))
+eccc[is.na(eccc$noise),]$obsNoise <- "Unk" ## assume counts without noise ranking have none/light noise as per PC protocols
+
+eccc <- eccc %>%  
+  mutate(ts = ymd_hm(paste(year, month, day, hour_start, minute_start),  
+                     tz = "Canada/Yukon"),
+         method = "PC", dur_min = 10, dur = 600) %>% rename(observer = observer_num)
+visits <- rbind(visits, eccc %>% #filter(!is.na(ts)) %>% 
+                  select(names(visits)) %>% distinct())
+
+## remove sites not in sites list
+visits$station <- as.numeric(visits$station)
+visits <- semi_join(visits, sites)
+head(visits)
+
+visits %>% filter(siteID == 'SB108') %>% arrange(station, ts) ##paired ARU PC times don't match perfectly
+visits[visits$siteID == 'SB108' & visits$station == 6 & is.na(visits$ts), "ts"] <- visits[visits$siteID == 'SB108' & visits$station == 6 & !is.na(visits$ts), "ts"] #paired, so we know the time
+visits$year <- year(visits$ts)
+
+##missing time stamps
+visits[visits$siteID == "364872-D" & is.na(visits$ts), "year"] <- 2017
+visits[visits$siteID == "361264-D" & is.na(visits$ts), "year"] <- 2017
+visits[visits$siteID == "371138-B" & is.na(visits$ts), "year"] <- 2017
+visits[visits$siteID == "333099-D" & is.na(visits$ts), "year"] <- 2017
+
+sites <- left_join(sites, visits %>% select(siteID, year)%>%distinct())
+sites[sites$siteID == "SB010" & is.na(sites$year), "year"] <- 2021
+
+visits <- left_join(visits, as.data.frame(sites) %>% select(siteID, organization, station) %>% distinct())
+
+```
+
+## Counts dataframe
+
+This dataframe contains all the detections from ARUs and point counts.
+siteID, station, and ts and method link it to the visits and sites
+dataframes.
+
+```{r}
+counts <- aru %>% select(siteID, station, ts, species_code,  species_english_name, individual = species_individual_name, tag_min, abundance) %>% 
+  mutate(method = "ARU", detection_type = "A", distance_interval = NA, station = as.numeric(station))
+
+###eccc point counts
+eccc$time_interval <- as.numeric(eccc$time_interval)
+tmp <- eccc %>% select(siteID, station, ts, species_code = species_id, tag_min=time_interval, abundance = count, detection_type, distance_interval) %>%
+  mutate(species_english_name = NA, method = "PC", station = as.numeric(station))
+
+counts <- rbind(counts, tmp %>% arrange(ts, tag_min) %>%  group_by(siteID, station, ts, species_code) %>% mutate(individual = row_number()) %>% select(names(counts)))
+
+###WCS point counts
+wcs.det <- read.csv("E:/Archive/0_data/EW2021-JUL-21_Detections.csv")
+names(wcs.det) <- c("siteID", "station", "species_code", "breeding_code", "age", "sex", "abundance", "tag_min", "distance_interval", "detection_type", "direction", "comments")
+
+table(wcs.det$tag_min)
+wcs.det$tag_min <- ifelse(wcs.det$tag_min %in% c("AFTER", "BEFORE"), Inf, ifelse(wcs.det == "", NA, as.numeric(wcs.det$tag_min)))
+
+wcs.det <- visits %>% filter(method == "PC") %>% select(siteID, station, ts, method) %>% 
+  right_join(wcs.det) %>% arrange(ts, tag_min) %>%  
+  group_by(siteID, station, ts, species_code) %>% mutate(individual = row_number()) %>% 
+  mutate(scientific_name = NA, species_english_name = NA)
+counts <- rbind(counts, wcs.det %>% select(names(counts)))
+
+## remove sites not in sites list
+counts <- semi_join(counts, sites)
+counts <- left_join(counts, select(visits, siteID, station) %>% distinct())
+head(counts)
+
+```
+
+# Cleaning count data
+
+### More misidentified species
+
+```{r add family, error=TRUE}
+# From Logan:
+#"TAHU", "CALU", "LYPA", "MYRU", "MAMO", "VUVU", "MUNI", "OCCO", "RNPL", "SSHO", "SPPA",  “ALAM”
+#In order the codes in question correspond to:
+#Red squirrel, Wolf, Lynx, Northern Red-backed Vole, Woodchuck, Fox, Least Weasel, Collared Pika, Red-necked Phalarope (old), Small Shorebird, Arctic Ground Squirrel, and Moose.
+nonbird <- c("ALAM", "TAHU", "CALU", "LYPA", "MYRU", "MAMO", "VUVU", "MUNI", "OCCO",  "SPPA", "RED SQUIRREL", "AMERICAN TREE TOAD")
+counts <- filter(counts, ! species_code %in% nonbird)
+
+
+counts <- filter(counts, !is.na(species_code)) ## empty rows, but detections for that visit (i.e. not "NONE")
+
+### fix unusual species codes?
+try(counts[counts$species_code == "CAGO",]$species_code <- "CANG")  #could also be cackling goose, but less likely
+try(counts[counts$species_code == "TRSP",]$species_code <- "ATSP")  #American tree sparrow?
+try(counts[counts$species_code == "YWAR",]$species_code <- "YEWA") ## yellow warbler?
+try(counts[counts$species_code == "PMWA",]$species_code <- "WPWA") ## palm warbler?
+try(counts[counts$species_code == "GRAJ",]$species_code <- "CAJA") ###taxonomic change
+try(counts[counts$species_code == "TTWO",]$species_code <- "ATTW") ## American Three-toed woodpecker
+try(counts[counts$species_code == "SSHO",]$species_code <- "SSHA") #typo?
+try(counts[counts$species_code == "RNPL",]$species_code <- "UNKN")
+try(counts[counts$species_code == "BLWA",]$species_code <- "BLPW") ##blackpoll, also wrong in field report
+try(counts[counts$species_code == "BASW" ,]$species_code <- "TRES") ## written as TRSW on field datasheet (Hard copy, transcription error)
+try(counts[counts$species_code == "SASP",]$species_code <- "SAVS")
+try(counts[counts$species_code == "RNPL",]$species_code <- "RNPH") ##Red-necked Phalarpe
+
+ ## rednecked phalarope
+
+
+
+##Unidentified codes
+try(counts[counts$species_code == "WARB",]$species_code <- "UNWA") ## Unk warbler
+try(counts[counts$species_code == "WOOD",]$species_code <- "UNWO") ## unidentified woodpecker based on comments in eccc
+try(counts[counts$species_code == "SPAR",]$species_code <- "UNSP") ## unidentified sparrow
+try(counts[counts$species_code == "OWL ",]$species_code <- "UNOW") ## unknown owl 
+try(counts[counts$species_code == "OWL",]$species_code <- "UNOW") ## unknown owl 
+try(counts[counts$species_code == "LONG",]$species_code <- "UNLO") ##LALO or SMLO
+try(counts[counts$species_code == "UTBB",]$species_code <- "UNBT") #Unidentified Black-backed / American Three-toed Woodpecker
+try(counts[counts$species_code == "MYRU",]$species_code <- "UNKN") ## no idea Myrtle warbler /yellow rumped warbler?
+try(counts[counts$species_code == "RAPT",]$species_code <- "UNRA") ## unknown raptor
+try(counts[counts$species_code == "NOOO",]$species_code <- "NONE") ##based on comments
+try(counts[counts$species_code == "SWAL",]$species_code <- "UNSW")
+try(counts[counts$species_code == "SFAL",]$species_code <- "UNFA") #kestral or merlin
+try(counts[counts$species_code == "THRU",]$species_code <- "UNTH")
+try(counts[counts$species_code == "PASS",]$species_code <- "UNPA")
+try(counts[counts$species_code == "FINC",]$species_code <- "UNFI")
+try(counts[counts$species_code == "UNK 'PIK'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK WOODPECKER",]$species_code <- "UNWO")
+try(counts[counts$species_code == "UNK 'HAY'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "CAJA?",]$species_code <- "CAJA")
+try(counts[counts$species_code == "NOWA/GULL?",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'CHIP'",]$species_code <- "UNPA")
+try(counts[counts$species_code == "UNK GULL",]$species_code <- "UNGU")
+try(counts[counts$species_code == "CORE/PISI?",]$species_code <- "UNFI")
+try(counts[counts$species_code == "NOFL?",]$species_code <- "UNWO")
+try(counts[counts$species_code == "UNK 'WEEEEE'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'TA TA TA DWI DA DI'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "HETH/VATH?",]$species_code <- "UNTH")
+try(counts[counts$species_code == "AMRO/NOFL?",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'woo woo waa'" ,]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'WHAAAAA'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "CHSP?",]$species_code <- "UNSP")
+try(counts[counts$species_code == "YRWA?",]$species_code <- "UNWA")
+try(counts[counts$species_code == "UNK 'CHIK CHICK CHICK'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "DEJU?" ,]$species_code <- "UNSP")
+try(counts[counts$species_code == "UNK DUCK FLIGHT" ,]$species_code <- "UNDU")
+try(counts[counts$species_code == "UNK TRILL",]$species_code <- "UNTR")
+try(counts[counts$species_code == "UNK 'TI-WHI TI-WHI'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK SPARROW",]$species_code <- "UNSP")
+try(counts[counts$species_code == "UNK SHOREBIRD" ,]$species_code <- "UNSH")
+try(counts[counts$species_code == "SSHO" ,]$species_code <- "UNSH") ##unidentified small shorebird
+try(counts[counts$species_code == "UNK 'WIP WIP WIP'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK RAPTOR",]$species_code <- "UNRA")
+try(counts[counts$species_code == "UNK 'I WII I WI IWI IWI'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK SWALLOW",]$species_code <- "UNSW")
+try(counts[counts$species_code == "UNK 'PIYO-PIYO-PIPI-PEW'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'HEIIIII'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'TI-OUI  TI-OUI TI-OUI'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "RUBL?",]$species_code <- "UNBL")
+try(counts[counts$species_code == "UNK 'WEEPA WOO'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "CORE?",]$species_code <- "UNFI")
+try(counts[counts$species_code == "UNK SPARROW 'TI TI THRIIIIIII IP'",]$species_code <- "UNSP")
+try(counts[counts$species_code == "UNK FLYOVER \"CHIT CHIT\"",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'PEER PEER'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'TSSSSST'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'HE-HE HUP HUP HUP'" ,]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'CRT CRT BEET BEET BEET BEET'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK OWL 'WOOOOOOOFFFF'",]$species_code <- "UNOW")
+try(counts[counts$species_code == "UNK 'QRI WIIIIII'"  ,]$species_code <- "UNKN")
+try(counts[counts$species_code == "PIGR?",]$species_code <- "UNFI")
+try(counts[counts$species_code == "UNK 'CHEEEE'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK FLYOVER \"BEER\"",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'ZRRRIIIII'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "YRWA/NOWA?",]$species_code <- "UNWA")
+try(counts[counts$species_code == "COLO?",]$species_code <- "ULOO")
+try(counts[counts$species_code == "TRSW",]$species_code <- "TRES")
+try(counts[counts$species_code == "HAFL?",]$species_code <- "UNFL")
+try(counts[counts$species_code == "BOCH/CORE?",]$species_code <- "UNPA")
+try(counts[counts$species_code == "UNK 'CHIT CHI CHIT AWITA CHU'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK WARBLER 'SIP SIP'",]$species_code <- "UNWA")
+try(counts[counts$species_code == "UNKNOWN",]$species_code <- "UNKN")
+try(counts[counts$species_code == "GREBE",]$species_code <- "UGRE")
+try(counts[counts$species_code == "RUGR/SPGR",]$species_code <- "UGRS")
+try(counts[counts$species_code == "UNKNOWN ",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNKNOWN FLYOVER \"CHIT CHIT\"",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'OH WO-OHWO-OHWO'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'CRRT SIP SIP SIP'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "AMRO?",]$species_code <- "UNAM")
+try(counts[counts$species_code == "RCKI?",]$species_code <- "RCKI")
+try(counts[counts$species_code == "UNK 'HEYME HEYME YIP'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'WIT RRR WIT RRR'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "WIWA?",]$species_code <- "UNWA")
+try(counts[counts$species_code == "SWTH?",]$species_code <- "UNTH")
+try(counts[counts$species_code == "UNK 'WIT WIT'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'TIWICK' LOUD",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'WUAA WUAA'",]$species_code <- "UNKN")
+try(counts[counts$species_code == "UNK 'SEEP!'",]$species_code <- "UNKN")
+
+
+## add scientific and english names to detections with just species_code
+alphaCodes <- read_csv("E:/Archive/0_data/species_codes.csv")
+
+counts <- counts %>% left_join(alphaCodes %>% select(species_code = SPEC, scientific_name = SCINAME, COMMONNAME)) %>%
+  mutate(species_english_name = ifelse(is.na(species_english_name), COMMONNAME, species_english_name)) %>% 
+  select(-COMMONNAME)
+
+##common gull in alpha codes, 
+counts[counts$species_code == "MEGU",]$scientific_name <- "Larus canus" 
+counts[counts$species_code == "MEGU",]$species_english_name <- "Mew Gull"
+```
+
+### Add taxonomy
+
+Latin names were added to species codes based on apha code list
+published on <https://www.birdpop.org/pages/birdSpeciesCodes.php>
+
+Unfamiliar species codes from ECCC list: TAHU, CALU, LYPA, MYRU, MAMO,
+VUVU, MUNI, OCCO, RNPL, SSHO, SPPA. Some are repeated multiple times.
+Could be non-avian species (frogs, mammals, e.g. ALAM is moose). *For
+now, I will remove these sites, should ask someone from ECCC for a code
+list.* For WCS, species codes were corrected to most likely species, as
+non-avian species weren't given codes, and most corresponded with a
+likely species for the area.
+
+Order and family using AOS's North American Classification Committee's
+checklist of North and Middle American Birds (downloaded Feb 2022).\
+<http://checklist.americanornithology.org/taxa>
+
+```{r}
+taxon <- read_csv("E:/Archive/0_data/NACC_list_species.csv")
+
+#seperate scientific_name into genus and species
+counts$genus <- str_split_fixed(counts$scientific_name,  " ", 2)[,1]
+counts$species <- str_split_fixed(counts$scientific_name,  " ", 2)[,2]
+
+# counts <- mutate(counts, genus = ifelse(species_code %in% c("OCWA", "TEWA"), "Leiothlypis", genus)) ##genus typo
+counts <- mutate(counts, genus = ifelse(genus == "", NA, genus),
+              species = ifelse(species == "", NA, species))
+counts <- left_join(counts, taxon %>% select(order, family, subfamily, genus)%>% distinct())
+```
+
+### Unidentifieds
+
+Sometimes birds couldn't be identified to species, in which case their
+genus, family or order was identified as an unknown category.
+
+```{r Unidentified tags, error=TRUE}
+unidentified <- filter(counts, (is.na(family)| species_code %in% c("UNSW", "UNRE", "UPCH")) & !(species_code == "NONE")) %>% 
+  select(species_code, species_english_name, order, family) %>% distinct()
+##UNRE actually removed with removal of non-beringian sites. 
+
+unidentified$genus <- NA
+
+
+#Unidentified Woodpecker
+try(unidentified[unidentified$species_code == "UNWO",]$order <- "Piciformes")
+try(unidentified[unidentified$species_code == "UNWO",]$family <- "Picidae")	
+#genus either "Picoides" or "Sphyrapicus" or "Colaptes" (woodpecker, sapsucker, flicker)
+
+#Unidentified Blackbird
+try(unidentified[unidentified$species_code == "UNWA",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNWA",]$family <- "Icteridae")
+
+#Unidentified Warbler 
+try(unidentified[unidentified$species_code == "UNWA",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNWA",]$family <- "Parulidae")
+
+#Unidentified grebe
+try(unidentified[unidentified$species_code == "UGRE",]$order <- "Podicipediformes")
+try(unidentified[unidentified$species_code == "UGRE",]$family <- "Podicipedidae")
+
+#Unidentified grouse
+try(unidentified[unidentified$species_code == "UGRS",]$order <- "Galliformes")
+try(unidentified[unidentified$species_code == "UGRS",]$family <- "Phasianidae")
+
+#Unidentified loon
+try(unidentified[unidentified$species_code == "ULOO",]$order <- "Gaviiformes")
+try(unidentified[unidentified$species_code == "ULOO",]$family <- "Gaviidae")
+try(unidentified[unidentified$species_code == "ULOO",]$genus <- "Gavia")
+
+
+#Unidentified waterfowl (includes ducks geese, swans, etc.)
+try(unidentified[unidentified$species_code == "UNWT",]$order <- "Anseriformes")
+try(unidentified[unidentified$species_code == "UNWT",]$family <- "Anatidae")
+
+#Unidentified Duck (assuming dabblers, excludes shovelers, wideons, gadwalls, seaducks)
+try(unidentified[unidentified$species_code == "UNDU",]$order <- "Anseriformes")
+try(unidentified[unidentified$species_code == "UNDU",]$family <- "Anatidae")
+try(unidentified[unidentified$species_code == "UNDU",]$genus <- "Anas")
+
+#UNK GOLDENEYE
+try(unidentified[unidentified$species_code == "UGOL",]$order <- "Anseriformes")
+try(unidentified[unidentified$species_code == "UGOL",]$family <- "Anatidae")
+try(unidentified[unidentified$species_code == "UGOL",]$genus <- "Bucephala")
+
+#Unidentified Flycatcher
+try(unidentified[unidentified$species_code == "UNFL",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNFL",]$family <- "Tyrannidae")
+
+#Unidentified Gull
+try(unidentified[unidentified$species_code == "UNGU",]$order <-  "Charadriiformes")
+try(unidentified[unidentified$species_code == "UNGU",]$family <- "Laridae")
+
+#Unidentified Finch
+try(unidentified[unidentified$species_code == "UNFI",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNFI",]$family <- "Fringillidae")
+
+#Unidentified Sparrow
+try(unidentified[unidentified$species_code == "UNSP",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNSP",]$family <- "Passerellidae")
+
+#unidentified Swallow
+try(unidentified[unidentified$species_code == "UNSW",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNSW",]$family <- "Hirundinidae")
+try(unidentified[unidentified$species_code == "UNSW",]$genus <- "Hirundo")
+
+#Unidentified Black-backed / American Three-toed Woodpecker
+try(unidentified[unidentified$species_code == "UNBT",]$order <- "Piciformes")
+try(unidentified[unidentified$species_code == "UNBT",]$family <- "Picidae")
+try(unidentified[unidentified$species_code == "UNBT",]$genus <- "Picoides")
+
+#Unidentified Chickadee
+try(unidentified[unidentified$species_code == "UPCH",]$order <- "Piciformes")
+try(unidentified[unidentified$species_code == "UPCH",]$family <- "Paridae")
+try(unidentified[unidentified$species_code == "UPCH",]$genus <- "Poecile")
+
+## Unidentified Thrush
+try(unidentified[unidentified$species_code == "UNTH",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNTH",]$family <- "Turdidae")
+
+##unidentified Blackbird
+try(unidentified[unidentified$species_code == "UNBL",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNBL",]$family <- "Icteridae")
+
+##unidentified Shorebird
+try(unidentified[unidentified$species_code == "UNSH",]$order <-  "Charadriiformes")
+try(unidentified[unidentified$species_code == "UNSH",]$family <- "Scolopacidae")
+
+##unidentified Owl
+try(unidentified[unidentified$species_code == "UNOW",]$order <-  "Strigiformes")
+
+##unidentified Raptor
+try(unidentified[unidentified$species_code == "UNRA",]$order <-  "Accipitriformes")
+try(unidentified[unidentified$species_code == "UNRA",]$family <-  "Accipitridae")
+try(unidentified[unidentified$species_code == "UNHA",]$order <-  "Accipitriformes")
+try(unidentified[unidentified$species_code == "UNHA",]$family <-  "Accipitridae")
+##unidentified falcon
+try(unidentified[unidentified$species_code == "UNFA",]$order <-  "Falconiformes")
+try(unidentified[unidentified$species_code == "UNFA",]$family <-  "Falconidae")
+try(unidentified[unidentified$species_code == "UNFA",]$genus <-  "Falco")
+
+##unidentified longspur, either LALO or SMLO
+try(unidentified[unidentified$species_code == "UNLO",]$order <-  "Passeriformes")
+try(unidentified[unidentified$species_code == "UNLO",]$family <- "Calcariidae")
+try(unidentified[unidentified$species_code == "UNLO",]$genus <- "Calcarius")
+##Unidentified Trill  ## same as passerine?
+##Unidentified passerine in the American Robin Song Complex ## same as passerine?
+##Unidentified Passerine
+try(unidentified[unidentified$species_code == "UNAM",]$order <- "Passeriformes")
+try(unidentified[unidentified$species_code == "UNTR",]$order <-  "Passeriformes")
+try(unidentified[unidentified$species_code == "UNPA",]$order <-  "Passeriformes")
+
+try(unidentified[unidentified$species_code == "UNKN",]$species_english_name <- "Unknown")
+try(unidentified[unidentified$species_code == "UNPA",]$species_english_name <- "Unidentified Passerine")
+try(unidentified[unidentified$species_code == "UNLO",]$species_english_name <- "Unidentified Longspur")
+try(unidentified[unidentified$species_code == "UNBT",]$species_english_name <- "Unidentified Black-backed / American Three-toed Woodpecker")
+try(unidentified[unidentified$species_code == "UNRA",]$species_english_name <- "Unidentified Raptor")
+# unidentified[unidentified$species_code == "UNFA",]$species_english_name <- "Unidentified Falcon"
+try(unidentified[unidentified$species_code == "UNFI",]$species_english_name <- "Unidentified Finch")
+try(unidentified[unidentified$species_code == "UNGU",]$species_english_name <- "Unidentified Gull")
+try(unidentified[unidentified$species_code == "UNTR",]$species_english_name <- "Unidentified Trill")
+try(unidentified[unidentified$species_code == "UNSH",]$species_english_name <-  "Unidentified Shorebird")
+try(unidentified[unidentified$species_code == "ULOO",]$species_english_name <- "Unidentified Loon")
+try(unidentified[unidentified$species_code == "UGRE",]$species_english_name <-  "Unidentified Grebe")
+try(unidentified[unidentified$species_code == "UGRS",]$species_english_name <-  "Unidentified Grouse")
+try(unidentified[unidentified$species_code == "UNAM",]$species_english_name <-  "Unidentified passerine in the American Robin Song Complex")
+
+unidentified <- distinct(unidentified)
+unidentified 
+
+counts <- counts %>% left_join(unidentified %>% rename(order_u = order, family_u = family, genus_u = genus, eng_u = species_english_name))
+#remove order/family/genus from UNSW and UNRE, so all unknowns for their latin names
+counts[counts$species_code %in% unidentified$species_code, c("order", "family", "genus", "species")] <- NA 
+counts <- mutate(counts, species_english_name = ifelse(species_code %in% unidentified$species_code, eng_u, species_english_name)) %>% select(-eng_u)
+
+counts$unk<- ifelse(counts$species_code %in% unidentified$species_code, T, F)
+
+```
+
+### Check for species at risk detections.
+
+Species at risk and their status are based on
+<https://yukon.ca/en/species-risk#species-at-risk-in-the-yukon> (Feb
+2022)
+
+```{r SAR}
+species_code <- c("BANS", "BARS", "CAWA", "CONI", "HUGO", "LEYE", "OSFL", "REKN", "BBSA", "EVGR", "HOGR", "REPH", "RUBL", "SEOW") ##redknot only roselaari type?
+status <- c("THR", "SC", "SC", "SC", "THR", "THR", "SC", "THR", "SC", "SC", "SC", "SC", "SC", "THR")
+sar <- data.frame(species_code, status)
+sar %>% left_join(counts %>% select(species_code, species_english_name) %>% distinct()) ##NAs are SAR that weren't detected
+counts$sar <- ifelse(counts$species_code %in% sar$species_code, T, F)
+
+counts %>% filter(sar == T) %>% group_by(species_english_name) %>% summarise(n=n())
+```
+
+### Large homerange
+
+Species with large home ranges are unlikely to be affected by
+disturbance within our buffers (150-300m). The Rapters (order
+accipitriformes), owls (stringiformes), gulls/terns (family laridae) and
+cranes (gruidae) were identified as species with homeranges that are too
+large to be relevant. Corvides (ravens and canada jays) could also
+potentially be removed, but are retained for now.
+
+> CORA: keep? similar to corvids? but if reduce buffer to 150m should
+> remove -Average home range size of ravens in RNSP was 182.5 ha (range
+> 82-381 ha) and average core-use area was 31.4 ha (range 5-71 ha).
+> <https://scholarworks.calstate.edu/concern/theses/x346d6604>\
+> -When off the nest, breeding ravens were an average of 0.8 km (95% CI:
+> 0.5–1.3 km) from the nest. Ravens that were not actively attending a
+> nest had significantly higher average location distances than breeding
+> ravens, including post-successful (0.3 km farther, P = 0.001; mean
+> distance 1.1 km, 95% CI: 0.6–1.9), post-failed (8.6 km farther, P \<
+> 0.001; mean distance 9.4 km, 95% CI: 5.4–16.7), and nonbreeding ravens
+> (9.6 km farther, P \< 0.001; mean distance 10.4 km, 95% CI: 4.1–26.3).
+> <https://esajournals.onlinelibrary.wiley.com/doi/full/10.1002/ecs2.2348>\
+> -home range median = 1.2 km2 (0.04-4.4 km2).
+> <https://www.jstor.org/stable/3671670?seq=2#metadata_info_tab_contents>
+
+> Canada Jay: keep? similar to corvids? but if reduce buffer to 150m
+> should remove -Average territory size estimated at 69 ha in Réserve de
+> la Vérendrye, Quebec, 129 ha in Algonquin Park, Ontario, and 27 ha on
+> Anticosti Island, Quebec, based on respective mean internest distances
+> of 890 m (n = 6), 1,220 m (n = 59) and 561 m (n = 9), and the
+> assumption that territories may be likened to similar contiguous
+> hexagons with nests at centers (DS). Delehanty (129) found mean
+> territory sizes of 23.2 and 15.8 ha in control and food-supplemented
+> areas in the same southwestern Yukon area where Shank (151) had
+> earlier reported a mean size of 41 ha. Walley (165) gave 65 ha as
+> approximate territory size in Manitoba. From: Birds of the
+> world\>canada jay\> behaviour \> spacing
+
+> Sandhill cranes: remove -99±50.8 (SE) ha (harmonic mean method, 75 %
+> utilization) and were of 2 types: feeding grounds separated from
+> nesting habitat and feeding grounds adjacent to nesting habitat.
+> <https://digitalcommons.unl.edu/nacwgproc/213/>\
+> -50% core area: x̄ = 525.4 ha,
+> <https://meridian.allenpress.com/jfwm/article/8/2/436/204367/Summer-Habitat-Selection-of-the-Lower-Colorado>\
+> -Mean home range size of breeding adults was 193 ha (95 CI = 242)
+> during the nesting seasons.
+> <https://etd.ohiolink.edu/apexprod/rws_olink/r/1501/10?clear=10&p10_accession_num=osu1408987504>
+
+> AMKE: keep? similar to corvids? but if reduce buffer to 150m should
+> remove - home range diameters 0.31mi, 0.7 mi, 1.4 mi, 1.5 mi. From
+> <https://doi.org/10.2307/3669841>
+
+```{r large HR}
+##large home ranges
+order.HR = c("Accipitriformes", "Strigiformes")
+family.HR = c("Laridae", "Gruidae")
+sc.HR = c("UNRA", "UNGU", "UNOW", "UNHA", "CORA")
+species.HR <- filter(counts, order %in% order.HR | family %in% family.HR | species_code %in% sc.HR) %>% select(species_code, species_english_name) %>% distinct()
+species.HR
+```
+
+## Summarise count data
+
+Per siteID, calculate n species, n families, total abundance, diversity
+index, n.stations, total recording time.
+
+```{r counts sum1}
+#N. stations per site
+counts_sum <- visits %>% select(siteID, station, year, method, dur_min) %>% distinct() %>% 
+  group_by(siteID, year, method) %>% 
+  summarise(n.stations = n(), mn.count.dur = mean(dur_min)) ##several stations with just 1 recording? don't have full hex code
+hist(counts_sum$n.stations, breaks = seq(.5,max(counts_sum$n.stations) + .5, by = 1)) ## n stations per site. Lots! of sites with just 1 station
+
+counts_sum <- as.data.frame(sites) %>% select(siteID, organization) %>% distinct() %>% left_join(counts_sum)
+
+#recording time per site
+counts_sum <- visits %>% group_by(siteID, method) %>% summarise(total.time = sum(dur_min)) %>% left_join(counts_sum)
+hist(counts_sum$total.time)
+```
+
+`counts` Is a dataframe of all individual detections along with site ID,
+station, visit timestamp, tag minute and detection type.
+
+`counts_sum` Summaries were done at the site level (combining multiple
+stations), and across all visits,\
+`n.species` is the number of unique species across all visits and
+stations per site `n.family` is the number of unique families across all
+visits and stations per site `abundance` is the mean abundance across
+counts per station, and across stations. (longer counts might have
+higher abundance, n. visits and n.stations shouldn't affect abundance)
+`species.abundance.l` is a list, where each site and survey type (ARU,
+PC) has its own dataframe containing the abundance of each species
+detected across all stations. Abundance here is the highest count in
+each visit, summed across all visits (should increase with n visits and
+n. stations). This is used to report abundance of SAR in counts_sum
+`div.shan` is the shannon diversity index, using the summmed max
+abundance of species across all stations (in species.abundance.l).
+(should increase with n.stations)
+
+Unidentified species:\
+- for n.species, n.family, diversity indices: unidentifieds were counted
+as a new species in that count/summary if no other species of the same
+genus/family/order had already been detected at that site.\
+- for abundance: Unidentified species were counted.
+
+Large homerange species (identified with `order.HR`, `family.HR`) were
+removed from summaried. summaried including these species end with
+`.all`
+
+```{r counts sum2}
+counts <- mutate(counts, site2 = paste(siteID, method)) %>% distinct()
+counts.l <- split(counts %>% left_join(visits %>% select(siteID, organization) %>% distinct()), f = counts$site2) ### list per siteID
+
+##when to count unknowns...
+counts.l <- lapply(counts.l, function(site){
+  #create list of known genuses at that site. Unidentifieds have NA for order/family/genus/species, and *_u is filled in down to the level of identification.  Fully identified species have NAs in *_u columns. 
+  genus_known <- unique(site$genus)
+  genus_known <- genus_known[!is.na(genus_known)]
+  ##if unknown genus (genus_u) is known, and is not in the list of known genuses at that site, set species to 'unk' (will be counted as unique spec)
+  if(length(site[!is.na(site$genus_u) & !site$genus_u %in% genus_known,]$species) > 0) {
+  site[!is.na(site$genus_u) & !site$genus_u %in% genus_known,]$species <- "unk"
+  }
+  #Repeat for family
+  family_known <- unique(site$family)
+  family_known <- family_known[!is.na(family_known)]
+  
+  if(length(site[!is.na(site$family_u) & !site$family_u %in% family_known,]$species) > 0){
+  site[!is.na(site$family_u) & !site$family_u %in% family_known,]$species <- "unk"
+  site[!is.na(site$family_u) & !site$family_u %in% family_known,]$genus <- "unk"
+  }
+  #Repeat for order
+  order_known <- unique(site$order)
+  order_known <- order_known[!is.na(order_known)]
+  
+  if(length(site[!is.na(site$order_u) & !site$order_u %in% order_known,]$species)>0){
+  site[!is.na(site$order_u) & !site$order_u %in% order_known,]$species <- "unk"
+  site[!is.na(site$order_u) & !site$order_u %in% order_known,]$genus <- "unk"
+  site[!is.na(site$order_u) & !site$order_u %in% order_known,]$family <- "unk"
+  }
+  
+  ##now copy over the orders, families, genus of unknowns if still missing
+  site[is.na(site$order),]$order <- site[is.na(site$order),]$order_u
+  site[is.na(site$family),]$family <- site[is.na(site$family),]$family_u
+  site[is.na(site$genus),]$genus <- site[is.na(site$genus),]$genus_u
+
+  return(site)
+})
+
+counts <- data.table::rbindlist(counts.l)
+
+##unknowns are now filled in as species in some sites, and not others, depending on whether they should be counted. 
+#filter(aru, species_code == "UNFI") %>% select(order, family, genus, species) %>% distinct()
+
+##abundance
+##abundance at sites with no detections is 0
+counts[counts$species_code == "NONE", "abundance"] <- 0
+
+##sum of all rows per site/station/time
+counts_sum <- counts %>% group_by(siteID,  method) %>% summarise(abundance.all = sum(abundance)) %>%
+  left_join(counts_sum) ##cumulative abundance across all stations/visits
+
+##remove large HR birds
+counts_sum <- counts %>% mutate(abundance = ifelse(species_code %in% species.HR$species_code, 0, abundance)) %>% #don't count large HR, so set abundance to 0
+  group_by(siteID, station, ts, method) %>% summarise(abundance = sum(abundance)) %>% ##count abundance per recording
+  group_by(siteID, station, method) %>% summarise(abundance = mean(abundance)) %>% ## mean abundance per station
+  group_by(siteID, method) %>% summarise(abundance.mn = mean(abundance)) %>% ## mean abundance across all stations
+  left_join(counts_sum)
+
+##number of families
+counts_sum <- counts %>% filter(!species_code == "NONE" & !is.na(family) & ##remove unknown families (NA) and counts with no detections 
+                            !(species_code %in% species.HR$species_code)) %>% ## remove large HR birds
+  select(siteID, method, order, family) %>% distinct() %>% ##unique families per site
+  group_by(siteID, method) %>% summarise(n.family = n()) %>% left_join(counts_sum)
+
+counts_sum <- counts %>% filter(!species_code == "NONE" & !is.na(family)) %>% ##remove unknown families (NA) and counts with no detections
+  select(siteID, method, order, family) %>% distinct() %>% ##unique families per site
+  group_by(siteID, method) %>% summarise(n.family.all=n()) %>% left_join(counts_sum)
+ 
+##number of species
+counts_sum <- counts %>% filter(!species_code == "NONE" & !is.na(species) & ##remove unknown species (NA) and counts with no detections 
+                            !(species_code %in% species.HR$species_code)) %>% ## remove large HR birds
+  select(siteID, method, order, family, genus, species) %>% distinct() %>% ##unique species per site
+  group_by(siteID, method) %>% summarise(n.species = n()) %>% left_join(counts_sum)
+
+counts_sum <- counts %>% filter(!species_code == "NONE" & !is.na(species)) %>% ##remove unknown species (NA) and counts with no detections 
+  select(siteID, method, order, family, genus, species) %>% distinct() %>% ##unique species per site
+  group_by(siteID, method) %>% summarise(n.species.all = n()) %>% left_join(counts_sum)
+
+##abundance per species
+species.abundance.l <- lapply(counts.l, function(site){
+  site <- filter(site, !species_code == "NONE" & !is.na(species))
+  
+  ##make a dataframe where for each survey (station/time combination) there is a row for all species detected across all sites/surveys
+  site.expand <- expand_grid(site %>% select(station, ts) %>% distinct(), site %>% select(species_code) %>% distinct()) 
+  
+  ##add abundance s to the surveys. IF the species was not detected in that survey, NA is returned. This should be changed to 0. 
+  site.expand <- left_join(site.expand, site %>% select(station, ts, species_code, abundance)) 
+  site.expand[is.na(site.expand$abundance),]$abundance <- 0
+  
+  ##now calculate average abundance across stations 
+  site.expand <- site.expand %>% group_by(station, ts, species_code) %>% summarise(abundance = sum(abundance)) %>%##species count per survey
+    group_by(station, species_code) %>% summarise(abundance = mean(abundance)) %>% ##highest species count per station
+    group_by(species_code) %>% summarise(abundance = sum(abundance), n.stations = n()) #sum across sites
+  site.expand$method <- unique(site$method)
+    site.expand$organization <- unique(site$organization)
+    site.expand$siteID <- unique(site$siteID)
+    site.expand
+  
+})
+
+counts_sum$n.LEYE <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "LEYE",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.OSFL <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "OSFL",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.CONI <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "CONI",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.RUBL <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "RUBL",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.BANS <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "BANS",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.BARS <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "BARS",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+counts_sum$n.SEOW <- sapply(species.abundance.l, function(site) {
+  x <- site[site$species_code == "SEOW",]$abundance
+  ifelse(length(x)==0, 0, x)
+  })
+
+##diversity index
+##not accounting for n.station.
+counts_sum$div.shan.all <- sapply(species.abundance.l, function(site) shannon.index(site$abundance))
+counts_sum$div.shan <- sapply(species.abundance.l, function(site) shannon.index(site %>% filter(!(species_code %in% species.HR$species_code))%>% pull(abundance)))
+
+```
+
+### Overall summary
+
+```{r }
+##should be comparable across methods
+counts_sum %>% ggplot(aes(n.stations, abundance.mn, col = organization)) + geom_jitter()
+counts_sum %>% ggplot(aes(total.time, abundance.all, col = organization)) + geom_jitter()
+counts_sum %>% ggplot(aes(method, abundance.mn, fill = organization)) + geom_boxplot() 
+
+##n.species
+##should increase with n.stations
+counts_sum %>% ggplot(aes(n.stations, n.species, col = organization)) + 
+  geom_jitter() +facet_grid(cols = vars(method)) + theme_bw()##increases with n.stations, similar across methods
+counts_sum %>% ggplot(aes(total.time, n.species, col = organization)) + geom_jitter() ##increases with total time
+
+##n.families
+##should increase with n.stations
+counts_sum %>% ggplot(aes(n.stations, n.family, col = organization)) + 
+  geom_jitter() +facet_grid(cols = vars(method)) + theme_bw()##increases with n.stations, similar across methods
+counts_sum %>% ggplot(aes(total.time, n.family, col = organization)) + geom_jitter() ##increases with total time
+
+##diversity
+##should increase with n.stations
+counts_sum %>% ggplot(aes(n.stations, div.shan, col = organization)) + 
+  geom_jitter() +facet_grid(cols = vars(method)) + theme_bw()##increases with n.stations, similar across methods
+counts_sum %>% ggplot(aes(total.time, div.shan, col = organization)) + geom_jitter() 
+
+##top 20 species
+counts %>% group_by(species_code, species_english_name) %>% summarise(abundance = n()) %>% arrange(desc(abundance)) %>% print(n=30)
+
+## number of stations with SAR (0 is no detections of that species)
+table(counts_sum$n.LEYE >0)
+table(counts_sum$n.OSFL>0)
+table(counts_sum$n.CONI>0)
+table(counts_sum$n.RUBL>0)
+table(counts_sum$n.BANS>0)
+table(counts_sum$n.BARS>0)
+table(counts_sum$n.SEOW>0)
+
+##number of species where at least 1 individuals was detected at more than 15 sites
+dim(data.table::rbindlist(species.abundance.l) %>% group_by(species_code) %>% summarise(n.sites = n()) %>% filter(n.sites>15) %>% arrange(desc(n.sites)))
+##50 species detected at more than 15 sites
+dim(data.table::rbindlist(species.abundance.l) %>% group_by(species_code) %>% summarise(n.sites = n()) %>% filter(n.sites>50) %>% arrange(desc(n.sites)))
+##29 species detected at more than 50 sites
+saveRDS(species.abundance.l,  file.path(pipeline, "out", "spec_abun.RDS"))
+
+```
+
+## Save compiled data
+
+```{r}
+
+st_write(sites, file.path(pipeline, "out", "sites.shp"), delete_layer=T)
+saveRDS(sites, file.path(pipeline, "out", "sites.RDS"))
+visits <- filter(visits, !(organization == "WCS" & method == "PC"))
+write_csv(visits, file.path(pipeline, "out", "visits.csv"))
+saveRDS(visits, file.path(pipeline, "out", "visits.RDS"))
+
+write_csv(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path(pipeline, "out", "counts.csv"))
+saveRDS(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path(pipeline, "out", "counts.RDS"))
+
+write_csv(counts_sum, file.path(pipeline, "out", "counts_sum.csv"))
+saveRDS(counts_sum, file.path(pipeline, "out", "counts_sum.RDS"))
+
+#Mayo sites
+sites %>% st_crop(xmin = 296800, ymin = 984000, xmax = 391600, ymax = 1106450) %>% st_write(dsn = "2_pipeline/1_CountDataProcessing/tmp/sitesMayo.shp", delete_layer=T)
+
+## 2023 site coordinates
+tmp <- counts %>% mutate(year = year(ts)) %>% filter(year == 2023) 
+tmp <- tmp %>% group_by(siteID, station, ts, species_code, species_english_name, order, family, unk, sar) %>% summarise(abundance = sum(abundance))
+write_csv(tmp, file.path(pipeline, "tmp", "counts2023.csv"))
+
+```

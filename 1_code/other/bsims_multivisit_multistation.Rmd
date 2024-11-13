@@ -1,0 +1,1981 @@
+---
+title: 'QPAD assumptions: multi vists and multi station'
+author: "MJB"
+date: '2022-07-11'
+output: html_document
+---
+
+
+```{r}
+
+library(tidyverse)
+library(lme4)
+library(bSims)              # simulations
+library(detect)             # multinomial models
+
+set.seed(12)
+select <- dplyr::select
+```
+
+Combining different survey types
+
+WCS ARU: 5 stations, 6 visits, 3 minutes, ARU
+WCS 'PC': 9 stations, 1 visit, 10 minutes, ARU
+ECCC: combo of: 9 stations, 1 visit, 10 minutes, PC and 2 stations, 6 visits, 3 minutes, ARU
+
+### Survey parameters
+```{r}
+n.sites <- 150
+ext = 15 ##1500 x 1500m
+Den = 1.5
+
+phi = seq(0.35, 0.65, length.out = 6) 
+tauARU = .5
+tauPC = .9 
+
+aru_loc = matrix(c(3, -3, 3, 0, 3, 3,
+                   0, -3, 0, 0, 0, 3,
+                   -3, -3, -3, 0, -3, 3), byrow = T, ncol = 2)
+
+## 4 methods combined into 3 types
+#WCS ARU
+station1 = 5
+visits1 = 6
+dur1 = 3
+method1 = "ARU"
+
+xy1 <- list(aru_loc[1,], aru_loc[3,], aru_loc[5,], aru_loc[7,], aru_loc[9,]) #per station
+visits1 = list(6,6,6,6,6) # per station
+method1 = list(rep("ARU", 6), rep("ARU", 6), rep("ARU", 6), rep("ARU", 6), rep("ARU", 6)) # per station, per visit
+dur1 = list(rep(3, 6), rep(3, 6), rep(3, 6), rep(3, 6), rep(3, 6)) # per station, per visit
+
+
+#WCS 'PC'
+station2 = 9
+visits2 = 1
+dur2 = 10
+method2 = "ARU"
+
+xy2 <- list(aru_loc[1,], aru_loc[2,], aru_loc[3,], aru_loc[4,], aru_loc[5,], aru_loc[6,], aru_loc[7,], aru_loc[8,], aru_loc[9,]) #per station
+visits2 = list(1,1,1,1,1,1,1,1,1) # per station
+method2 = list("ARU","ARU","ARU","ARU","ARU","ARU","ARU","ARU","ARU") # per station, per visit
+dur2 = list(10,10,10,10,10,10,10,10,10) # per station, per visit
+
+# ECCC
+station3a = 9
+visits3a = 1
+dur3a = 10
+method3a = "PC"
+
+station3b = 2
+visits3b = 6
+dur3b = 3
+method3b = "ARU"
+
+xy3 <- list(aru_loc[1,], aru_loc[2,], aru_loc[3,], aru_loc[4,], aru_loc[5,], aru_loc[6,], aru_loc[7,], aru_loc[8,], aru_loc[9,]) #per station
+visits3 = list(1,1,7,1,7,1,1,1,1) # per station
+method3 = list("PC","PC",c(rep("ARU", 6), "PC"),"PC",c(rep("ARU", 6), "PC"),"PC","PC","PC","PC") # per station, per visit
+dur3 = list(10,10,c(rep(3, 6), 10),10,c(rep(3, 6), 10),10,10,10,10) # per station, per visit
+
+## 50 of each method
+xy <- c(rep(list(xy1), 50), rep(list(xy2), 50), rep(list(xy3), 50))
+visits <- c(rep(list(visits1), 50), rep(list(visits2), 50), rep(list(visits3), 50))
+method <- c(rep(list(method1), 50), rep(list(method2), 50), rep(list(method3), 50))
+dur <- c(rep(list(dur1), 50), rep(list(dur2), 50), rep(list(dur3), 50))
+
+```
+
+### make sites
+```{r}
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #150 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+surveys <- list()
+for(i in 1:length(sites)){ ## per site
+  method.i <- method[[i]]
+  visits.i <- visits[[i]]
+  dur.i <- dur[[i]]
+  xy.i <- xy[[i]]
+  
+  for(j in 1:length(visits.i)){ ## per station
+    visits.j <- visits.i[[j]]
+    xy.j <- xy.i[[j]]
+    
+    method.j <- method.i[[j]]
+    dur.j <- dur.i[[j]]
+    day.j <- sample(1:6, visits.j, replace = T)
+    
+    for(k in 1:visits.j){ ## per visit
+      method.k = method.j[[k]]
+      dur.k = dur.j[[k]]
+      day.k <- day.j[[k]]
+      phi.k = phi[day.k]
+      
+      tau.k <- ifelse(method.k == "PC", tauPC, tauARU)
+      
+      e = bsims_animate(sites[[i]], vocal_rate = phi.k, 
+                      duration=dur.k)
+      obs.k <- list(o = bsims_detect(e, tau = tau.k, 
+                                      xy = xy.j),
+                    site = i,
+                    station = j,
+                    visit = k,
+                    method = method.k,
+                    duration = dur.k,
+                    day = day.k)
+      surveys <- c(surveys, list(obs.k))
+    }
+  }
+}
+
+
+##sites share the same populated landscape, stations survey a different area with that landscape. 
+##stations have different number of visits. Visits can differ in methodology, duration, phi/date, corresponding with the main methods used in the actual study. 
+```
+
+##transcribe
+```{r}
+tint <- matrix(1:10, length(surveys), 10, byrow = T) #time design matrix
+rint <- matrix(c(.5,1,Inf), length(surveys), 3, byrow = T)
+# 
+# rint <- matrix(c(.5,1,Inf), n.sites, 3, byrow=TRUE) #distance design matrix
+# rint[51:150, ] <- rep(c(Inf, NA, NA), each = 100)
+
+
+transcribed <- list()
+for(i in 1:length(surveys)){
+
+  if(surveys[[i]]$dur == 3) tint[i, 4:10] <- NA
+
+  if(surveys[[i]]$method == "ARU") rint[i,] <- c(Inf, NA, NA)
+
+  t <- bsims_transcribe(surveys[[i]]$o, tint[i,], rint[i,])
+  transcribed[[i]] <- t
+}
+
+res <- lapply(transcribed, get_table)
+res[1] #aru3
+res[1600] #aru10
+res[2000] #ECCC
+
+# day <- unlist(day.l)
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- tint #time design matrix
+
+Ydur <- Ddur
+colnames(Ydur) <- names(colSums(res[[1600]]))
+
+for(i in 1:length(res)){
+  s <- res[[i]]
+  s <- colSums(s)
+  Ydur[i, 1:length(s)] <- s
+}
+
+##unique visits
+day <- sapply(surveys, function(x) x$day)
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+fitp1 <- cmulti(Ydur | Ddur ~ day, type="rem")
+AIC(fitp, fitp1) %>% arrange(AIC) # by day is better
+
+phihat <- drop(exp(model.matrix(fitp1) %*% coef(fitp1)))
+sort(unique(phihat)) ## estimated
+phi # actual
+
+Ddis <- rint
+Ydis <- Ddis
+
+for(i in 1:length(res)){
+  s <- res[[i]]
+  s <- rowSums(s)
+  Ydis[i, 1:length(s)] <- s
+}
+
+## can only use PC
+Ydis <- Ydis[!is.na(Ydis[,3]),]
+Ddis <- Ddis[!is.na(Ddis[,3]),]
+
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tauPC #true
+
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-apply(Ddur, 1, max, na.rm = T)*phihat)) ## phihat depends on day
+
+```
+
+### Observation df
+df of site, station, visit, day, method, abundance, A and p that will be used in glm model.
+```{r}
+obs.df <- data.frame(
+  site = sapply(surveys, function(x) x$site),
+  station = sapply(surveys, function(x) x$station),
+  visit = sapply(surveys, function(x) x$visit),
+  method = sapply(surveys, function(x) x$method),
+  dur = sapply(surveys, function(x) x$dur),
+  phiT = phi[sapply(surveys, function(x) x$day)], # true phi
+  Y = sapply(res, sum),
+  A = A, ## estimated based on PC
+  p = p ## estimated, varies with day and duration
+) 
+obs.df <- obs.df %>%
+  mutate(tauT = ifelse(method == "PC", tauPC, tauARU),## true tau
+      AT = pi*tauT^2, ## true Area
+      pT = (1-exp(-dur*phiT))) # true p
+
+obs.df <- mutate(obs.df, offT = AT*pT)
+
+```
+
+
+### site-level
+pool by site:
+Sum Y
+Sum A & average p for offset
+method = n.PC/n.visits... should hopefully correct for tau
+ 
+
+```{r}
+s1 <- obs.df %>% group_by(site) %>%
+  summarise(Y = sum(Y), A = sum(A), AT = sum(AT), 
+            p = mean(p), pT = mean(pT), offT = sum(offT), 
+            dur = sum(dur), n.visits = n(), n.aru = sum(method == "ARU"),
+            p.aru = n.aru/n.visits, n.stations = length(unique(station)))
+
+## actual tau values (difference in detection radius from ARU vs PC doesn't matter)
+##this just tests how A and p should be summarised at the group level
+mT <- glm(Y ~ 1, offset = log(AT*pT), data = s1, family = "poisson") #pT averaged across visits, AT summed
+mT2 <- glm(Y ~ 1, offset = log(offT), data = s1, family = "poisson") #(pT*AT) of each visit summed
+exp(coef(mT))
+exp(coef(mT2))
+Den ##mT2 is closer, but it makes little difference as both are highly correlated
+cor(s1$AT*s1$pT, s1$offT)
+
+AIC(mT, mT2) #mT2 is better
+
+
+## actual (averaged p), and correcting for p.aru
+m1 <- glm(Y ~ p.aru, offset = log(A*pT), data = s1, family = "poisson") # Y decreases as %aru increases
+exp(coef(m1)[1]) #density underestimated, but to similar degree as true model overestimates
+Den 
+exp(coef(m1)[2]) #should equal tauARU?
+tauARU
+
+##with method covariate
+m2 <- glm(Y ~ p.aru, offset = log(A*p), data = s1, family = "poisson") # Y decreases as %aru increases
+exp(coef(m2)[1]) #density underestimated, but to similar degree as true model overestimates
+Den 
+exp(coef(m2)[2]) #should equal tauARU?
+tauARU ## p averages out to same as pT
+
+#without method covariate
+m3 <- glm(Y ~ 1, offset = log(A*p), data = s1, family = "poisson") # Y decreases as %aru increases
+exp(coef(m3)) #density underestimated
+Den 
+
+
+
+
+##m2 >> m3
+ggplot(cbind(s1, resid(mT)), aes(p.aru, resid(mT), fill = factor(p.aru))) + geom_boxplot() 
+ggplot(cbind(s1, resid(m1)), aes(p.aru, resid(m1), fill = factor(p.aru))) + geom_boxplot()
+ggplot(cbind(s1, resid(m2)), aes(p.aru, resid(m2), fill = factor(p.aru))) + geom_boxplot()
+ggplot(cbind(s1, resid(m3)), aes(p.aru, resid(m3), fill = factor(p.aru))) + geom_boxplot()
+
+ggplot(cbind(s1, resid(mT)), aes(dur, resid(mT), fill = factor(dur))) + geom_boxplot()
+ggplot(cbind(s1, resid(m1)), aes(dur, resid(m1), fill = factor(dur))) + geom_boxplot() 
+ggplot(cbind(s1, resid(m2)), aes(dur, resid(m2), fill = factor(dur))) + geom_boxplot() 
+ggplot(cbind(s1, resid(m3)), aes(dur, resid(m3), fill = factor(dur))) + geom_boxplot() 
+
+ggplot(cbind(s1, resid(mT)), aes(n.stations, resid(mT), fill = factor(n.stations))) + geom_boxplot()
+ggplot(cbind(s1, resid(m1)), aes(n.stations, resid(m1), fill = factor(n.stations))) + geom_boxplot()
+ggplot(cbind(s1, resid(m2)), aes(n.stations, resid(m2), fill = factor(n.stations))) + geom_boxplot()
+ggplot(cbind(s1, resid(m3)), aes(n.stations, resid(m3), fill = factor(n.stations))) + geom_boxplot()
+
+
+AIC(mT, m1, m2, m3) %>% arrange(AIC) ## using A*p as offset now better than 
+
+```
+
+# Convert combined survey abundance to density using QPAD (not in model)
+
+```{r}
+plot(T.den, s1$Y/(s1$AT*s1$pT))
+abline(a=0, b=1)
+
+
+##Note, won't account for method or noise effects (modelled as covariates)
+plot(T.den, s1$Y/(s1$A*s1$p))
+abline(a=0, b=1)
+
+```
+
+
+#simplest
+
+## Survey parameters
+```{r}
+ext = 15 ##1500 x 1500m
+Den = .5
+dur = 3
+phi = .36
+tau = .75
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+tint = 1:3
+rint = c(.5,1,Inf)
+visits = 6
+```
+
+## make a populated landscape
+```{r}
+l <- bsims_init(extent=ext)  #landscape
+p <- bsims_populate(l, density = Den)  # population
+```
+
+##observations from 5 stations, 1 visit each. 
+stations share the same landscape, but have different events (i.e. not simultaneous)
+```{r}
+# o.stations.l <- apply(aru_loc, 1, function(loc) {
+#   e =  bsims_animate(p, 
+#   vocal_rate=phi, duration=max(tint)) ## events
+#   bsims_detect(e, tau = tau, xy = loc) ## detections from each station
+# }) 
+```
+
+## observations from 6 visits to 1 station
+visits share the same landscape, but have different events (i.e. not simultanious)
+
+```{r}
+# o.visits.l <- replicate(n=visits, bsims_animate(p, vocal_rate=phi, duration=3), simplify = F) ## events
+# o.visits.l <- lapply(o.visits.l, function(e) bsims_detect(e, tau = tau)) ## detections from center
+# 
+# plot(o.visits.l[[1]], col_vocal = "red", pch_vocal = 1, cex_vocal = .75)
+# points(0,0, cex = 1, col = "blue", pch = 16)
+# # points(0,0, cex = 3, col = "blue", pch = 1)
+```
+
+##5 stations, 6 visits each
+
+```{r}
+# o.l <- apply(aru_loc, 1, function(loc) {
+#   ## for each station...
+# o.visits.l <- replicate(n=visits, bsims_animate(p, #move_rate = 1,  movement = 0.25,
+#                                                 vocal_rate=phi, duration=3), simplify = F) ## 6 visits
+# o.visits.l <- lapply(o.visits.l, function(e) bsims_detect(e, tau = tau, xy = loc)) ## detections from station
+# names(o.visits.l) <- paste0("visit", 1:visits)
+# o.visits.l
+# })
+# 
+# length(o.l) ## 5 stations
+# length(o.l[[1]]) ## 6 visits
+```
+
+### Replicate sites
+100 sites/populated landscapes, each with 5 stations and 6 visits each. 
+```{r}
+n.sites <- 100
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #100 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true abundance
+T.abun <- sapply(sites, function(a) get_abundance(a))
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+```
+
+Now, survey the sites.
+Each site has 5 stations, and each station has 6 visits. 
+
+```{r}
+surveys <- lapply(sites, function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+    
+o.visits.l <- replicate(n=visits, bsims_animate(site, #move_rate = 1,  movement = 0.25,
+                                                vocal_rate=phi, duration=max(tint)), simplify = F) ## 6 visits
+o.visits.l <- lapply(o.visits.l, function(e) bsims_detect(e, tau = tau, xy = loc)) ## detections from station
+names(o.visits.l) <- paste0("visit", 1:visits)
+o.visits.l
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("site", 1:n.sites)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+# length(surveys[[1]][[1]]) #n.visits
+
+##reduce to 1 level list
+surv.l <- unlist(unlist(surveys, recursive = F), recursive = F)
+
+```
+
+### transcribe
+
+```{r}
+transcribed <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint, rint))
+res <- lapply(transcribed, get_table) ## each element is a PC, with detection divided amoung time and distance intervals
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- matrix(tint, length(res), length(tint), byrow=TRUE) #time design matrix
+Ydur <- t(sapply(res, function(z) colSums(z))) ## total detections summed within each time interval
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+phihat <- unname(exp(coef(fitp)))
+phihat #estimated
+phi #true
+
+Ddis <- matrix(rint, length(res), length(rint), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res, function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau #true
+
+##for 1 station, single visit
+Apq <- pi * tauhat^2 * ##area, based on EDR
+  (1-exp(-max(tint)*phihat)) * #p; probability of availability during max(tint) count
+  1 #q, 1 because area is adjusted using EDR
+
+# # ##with true values
+# Apq <- pi * tau^2 * ##area, based on EDR
+#   (1-exp(-max(tint)*phi)) * #Phi/probability of availability
+#   1 #q, 1 because area is adjusted using EDR
+
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5*visits),
+station = rep(rep(1:5, each = visits), n.sites),
+visit = rep(1:visits, 5*n.sites ),
+Y = sapply(res, sum),
+off = log(Apq),
+p = (1-exp(-max(tint)*phihat)),
+tau = tauhat,
+phi = phihat,
+A = pi*tauhat^2)
+
+mean(obs.df$Y / Apq)
+
+mean(obs.df$Y/ (pi * tau^2 * ##area, based on EDR
+  (1-exp(-max(tint)*phi)) * #Phi/probability of availability
+  1)) ## true values
+
+```
+
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+## treat individually
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+```
+
+Next we examine how we can combine counts across multiple visits to the same station. 
+```{r}
+# ## max visit, summed across stations. 
+# site.df1 <- obs.df %>% group_by(site, station, off, tau, phi) %>% 
+#   summarise(maxY = max(Y), mnY = mean(Y), medY = median(Y)) %>% mutate(A = pi*tau^2)
+# 
+# ## Max count. assume p = 1, only adjust for area
+# m0 <- glm(maxY ~ 1, offset = log(A), data = site.df1, family = "poisson")
+# exp(coef(m0)) ## over estimates counts
+# 
+# #Max count, with Qpad offset
+# m1 <- glm(maxY ~ 1, offset = off, data = site.df1, family = "poisson")
+# exp(coef(m1)) ## using max abundance of 6 visits will overestimate density. 
+# 
+# ##mean and median count, with qpad offset
+# m2 <- glm(mnY ~ 1, offset = off, data = site.df1, family = "poisson") ## non-integer warnings
+# exp(coef(m2)) ## better density estimate. 
+# 
+# m3 <- glm(medY ~ 1, offset = off, data = site.df1, family = "poisson") ## non-integer warnings
+# exp(coef(m3)) ## better density estimate. 
+# 
+# ##mixed model
+# library(lme4)
+# m4 <- glmer(Y ~ 1 + (1|site/station), offset = off, data = obs.df, family = "poisson")
+# exp(fixef(m4)) ## doesn't converge
+
+
+obs.df.site <- obs.df %>% group_by(site) %>% summarise(Y = sum(Y), p = mean(p), A = sum(A)) %>% mutate(offset = log(p*A))
+
+m <- glm(Y ~ 1, offset = offset, data = obs.df.site, family = "poisson")
+exp(coef(m))
+Den
+```
+
+How does N. visits influence counts?
+```{r}
+select <- dplyr::select
+v1 <- obs.df %>% group_by(site, station) %>% filter(visit == 1) %>% mutate(n.visits = 1) %>% ungroup() %>% select(site, station, Y, n.visits)
+v2 <- obs.df %>% group_by(site, station) %>% filter(visit %in% 1:2) %>% summarise(Y = max(Y)) %>% mutate(n.visits = 2) %>% ungroup()
+v3 <- obs.df %>% group_by(site, station) %>% filter(visit %in% 1:3) %>% summarise(Y = max(Y)) %>% mutate(n.visits = 3) %>% ungroup()
+v4 <- obs.df %>% group_by(site, station) %>% filter(visit %in% 1:4) %>% summarise(Y = max(Y)) %>% mutate(n.visits = 4) %>% ungroup()
+v5 <- obs.df %>% group_by(site, station) %>% filter(visit %in% 1:5) %>% summarise(Y = max(Y)) %>% mutate(n.visits = 5) %>% ungroup()
+v6 <- obs.df %>% group_by(site, station) %>% filter(visit %in% 1:6) %>% summarise(Y = max(Y)) %>% mutate(n.visits = 6) %>% ungroup()
+
+v.df <- rbind(v1, v2, v3, v4, v5, v6) %>% arrange(site, station)
+ggplot(v.df, aes(factor(n.visits), Y, fill = n.visits)) + geom_boxplot()
+ggplot(v.df, aes(n.visits, Y)) + geom_jitter() + 
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs", fx = TRUE, k = 5))
+
+### could we use a removal sampling method??
+v.df <- v.df %>% group_by(site, station) %>% mutate(y = ifelse(n.visits == 1, Y, Y-lag(Y)))
+
+Yv <- pivot_wider(ungroup(v.df) %>% select(site, station, n.visits, y), names_from = n.visits, values_from = y)
+Yv <- as.matrix(Yv[3:8])
+Dv <- matrix(rep(1:6, each = length(Yv[,1])), ncol = 6)
+
+(v = exp(coef(cmulti(Yv|Dv ~ 1, type = "rem")))) ## but this should relate to phi (higher phi, higher v?)
+phihat
+phi
+site.df1$v <- 1-exp(-6*v)
+# Dv <- matrix(rep(3*1:6, each = length(Yv[,1])), ncol = 6)
+# (v = exp(coef(cmulti(Yv|Dv ~ 1, type = "rem")))) ## doesn't work to include as continious time intervals
+# phihat
+# phi
+
+curve(1-exp(-x*v), from = 1, to = 6)
+
+## max visit, summed across stations. 
+#Max count, with Qpad offset
+site.df1 <- mutate(site.df1, off1 = off+log(v), off2 = off+log(1-v), off3 = log(pi*tau^2*(1-exp(-6*v)))) 
+m1 <- glm(maxY ~ 1, offset = off, data = site.df1, family = "poisson")
+exp(coef(m1)) ## using max abundance of 6 visits will overestimate density. 
+m1.1 <- glm(maxY ~ 1, offset = off1, data = site.df1, family = "poisson")
+exp(coef(m1.1)) ## using max abundance of 6 visits will overestimate density. 
+m1.2 <- glm(maxY ~ 1, offset = off2, data = site.df1, family = "poisson")
+exp(coef(m1.2)) ## using max abundance of 6 visits will overestimate density.
+m1.3 <- glm(maxY ~ 1, offset = off3, data = site.df1, family = "poisson")
+exp(coef(m1.3)) ## using max abundance of 6 visits will overestimate density.
+Den ## none work. 
+
+```
+
+### Subsampling
+From BAM: https://borealbirds.github.io/methods/
+
+"We resampled the data set in each region so that we had a single data point from each cluster/year combination and fit BRTs to the resampled data set. This subsampling addressed instances where multiple visits to the same location occurred within the same year. The subsampling was repeated 32 times."
+
+"We accounted for differences in sampling protocol and covariate effects on detectability using statistical offsets. This included the effects of time of day and day of year on the probability of availability given presence, and the effects of tree cover and land-cover type on the probability of detection given availability (Sólymos et al. 2013). Offsets were calculated based on removal and distance-sampling models (Sólymos 2016, Sólymos et al. 2018). These models were used to predict availability and detectability for each species given survey-specific covariates. The adjustments appeared as offsets in the BRTs so that expected values represented species density."
+
+"We assumed that ARU detectability is similar to detectability by human observers (Yip et al. 2017). Nevertheless, we used an indicator variable to account for possible differences in effective area sampled between human counts and ARUs following Van Wilgenburg at el. (2017)."
+
+```{r}
+n = 50
+
+df.l <- replicate(n, obs.df %>% group_by(site, station) %>% 
+                    slice_sample(n = 1) %>% ungroup(), simplify = F)
+m.l <- lapply(df.l, function(df) {
+  m.i = glm(Y ~ 1, offset = off, data = df, family = "poisson")
+})
+
+D.hat <- sapply(m.l, function(m) exp(coef(m)))
+hist(D.hat)
+mean(D.hat)
+sd(D.hat)
+```
+
+## Site level - sum counts and area from subset data
+```{r}
+##using subsampled data
+## all 5 sites
+site.l <- lapply(df.l, function(df){
+  df %>% group_by(site) %>% 
+    summarise(Y = sum(Y), A = sum(A), phi = mean(phi)) %>% 
+    mutate(off = log(A*(1-exp(-max(tint)*phi))*1))
+})
+
+T.off <- log(pi*tau^2*5*(1-exp(-max(tint)*phi)))
+
+sm.l <- lapply(site.l, function(df) {
+  # df$T.off <- T.off
+  m.i = glm(Y ~ 1, offset = off, data = df, family = "poisson")
+})
+
+D.hat <- sapply(sm.l, function(m) exp(coef(m)))
+hist(D.hat)
+mean(D.hat) ## Density is overestimated when counts are combined at a site. 
+sd(D.hat)
+
+##does density estimate change with n. sites?
+site.l <- lapply(df.l, function(df){
+  n.stations <- sample(1:5, 1)
+  df <- df %>% group_by(site) %>% slice_sample(n = n.stations)  
+  df <- df %>% group_by(site) %>% summarise(Y = sum(Y), A = sum(A), phi = mean(phi)) %>% mutate(off = log(A*(1-exp(-max(tint)*phi))*1), n.stat = n.stations)
+})
+
+sm.l <- lapply(site.l, function(df) {
+  # df$T.off <- T.off
+  m.i = glm(Y ~ 1, offset = off, data = df, family = "poisson")
+})
+
+D.hat <- sapply(sm.l, function(m) exp(coef(m)))
+n.stat <- sapply(site.l, function(s) unique(s$n.stat))
+
+plot(n.stat, D.hat)
+
+```
+
+## Adding Inf for repeated visits?
+
+```{r}
+obs.df <- obs.df %>% group_by(site, station) %>% mutate(Ymax = max(Y), dY = Ymax-Y)
+
+Ydur <- cbind(Ydur, obs.df$dY)
+Ddur <- cbind(Ddur, rep(Inf, length(obs.df$site)))
+
+fitp.Inf <- cmulti(Ydur | Ddur ~ 1, type="rem")
+phihat.Inf <- unname(exp(coef(fitp.Inf)))
+phihat.Inf ## with extra counts in Inf
+phihat #estimated
+phi #true
+
+### Adding detections from other Phi may be picking up effects of detectability, not availability??  OR it violates the poisson process. 
+
+```
+
+
+# Check different time intervals work
+### Survey parameters
+```{r}
+ext = 1 ##1500 x 1500m
+Den = .5
+dur = 10
+phi = .36
+tau = .75
+tint = 1:10
+rint = c(.5,1,Inf)
+```
+
+### Replicate
+```{r}
+b <- bsims_all(
+  density=Den,
+  vocal_rate=phi,
+  tau=tau,
+  tint=tint,
+  rint=rint)
+
+B <- 200
+set.seed(123)
+sim <- b$replicate(B, cl=2)
+res <- lapply(sim, get_table) ## each element is a PC, with detection divided amoung time and distance intervals
+
+Ddur <- matrix(tint, B, length(tint), byrow=TRUE) #time design matrix
+Ydur <- t(sapply(res, function(z) colSums(z))) 
+
+## simulate combining two different PC lengths
+Ddur[1:100, 4:10] <-NA
+Ydur[1:100, 4:10] <-NA
+long <- rep(0:1, each = 100)
+
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+phihat <- unname(exp(coef(fitp)))
+phihat
+
+fitp1 <- cmulti(Ydur | Ddur ~ long, type="rem")
+(ci <- confint(fitp1)[2,]) ## No methodological effect.
+
+phihat <- unname(exp(coef(fitp)))
+phihat
+
+```
+
+
+# Explore ARU effect
+### Survey parameters
+```{r}
+ext = 15 ##1500 x 1500m
+Den = 1
+dur = 3
+phi = .5
+tau1 = 1
+tau2 = 0.6
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+tint = 1:3
+rint1 = c(.5,1,Inf)
+rint2 = Inf
+visits = 6
+```
+
+### make sites
+```{r}
+n.sites <- 100
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #100 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+##PC
+surveys <- lapply(sites[1:50], function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+  e <- bsims_animate(site, vocal_rate=phi, duration=max(tint))## availability during survey at station
+ bsims_detect(e, tau = tau1, xy = loc) ## detections from station
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("pc.site", 1:50)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+surv.l <- unlist(surveys, recursive = F)
+
+transcribed.pc <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint, rint1))
+
+
+## ARU
+surveys <- lapply(sites[51:100], function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+  e <- bsims_animate(site, vocal_rate=phi, duration=max(tint))## availability during survey at station
+ bsims_detect(e, tau = tau2, xy = loc) ## detections from station
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("aru.site", 51:100)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+surv.l <- unlist(surveys, recursive = F)
+
+transcribed.aru <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint, rint2))
+
+##ARU surveys have a different tau, and unknown distance bands
+
+transcribed <- c(transcribed.pc, transcribed.aru)
+res <- lapply(transcribed, get_table)
+res[1] #pc
+res[500] #aru
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- matrix(tint, length(res), length(tint), byrow=TRUE) #time design matrix
+Ydur <- t(sapply(res, function(z) colSums(z))) ## total detections summed within each time interval
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+phihat <- unname(exp(coef(fitp)))
+phihat #estimated
+phi #true
+
+Ddis <- matrix(rint1, length(res[1:250]), length(rint1), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res[1:250], function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau1 #true
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-max(tint)*phihat))
+Apq <- pi * tauhat^2 * ##area, based on EDR
+  p * #p; probability of availability during max(tint) count
+  1 #q, 1 because area is adjusted using EDR
+off <- log(Apq)
+
+delta2 <- sum(Ydur[251:500])/sum(Ydur[1:250]) ## not paired, but we know p and D are the same because we simulated
+delta2 ## estimated
+tau2^2/tau1^2 ## true
+
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5),
+station = rep(1:5, n.sites),
+Y = sapply(res, sum),
+off = log(Apq),
+A = A,
+p = p,
+method = factor(rep(c("PC", "ARU"), each = n.sites/2*5))) %>% 
+  mutate(ARU = ifelse(method == "PC", 0, 1),
+         Adelta = ifelse(method == "PC", A, pi*delta2*tauhat^2),
+         AT = ifelse(method == "PC", 
+                       pi*tau1^2, 
+                       pi*tau2^2),
+         OffT = ifelse(method == "PC", 
+                       log(pi*tau1^2*(1-exp(-3*phi))), 
+                       log(pi*tau2^2*(1-exp(-3*phi)))))
+```
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+## true values
+mT <- glm(Y ~ 1, offset = OffT, data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(mT)), aes(method, resid(mT), fill = method)) + geom_boxplot() ##still inherent bias in the data just by chance.  
+
+
+##scaling factor
+md <- glm(Y ~ 1, offset = log(Adelta*(1-exp(-max(tint)*phihat))), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() ##still some method effect...
+
+## treat individually
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(obs.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+
+m2 <- glm(Y ~ ARU, offset = off, data = obs.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+
+ggplot(cbind(obs.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot() ##method effect not corrected for?
+
+mm <- glmer(Y ~ (1|ARU), data = obs.df, family = "poisson")
+
+AIC(mT, md, m, m2, mm) %>% arrange(AIC) ## m2 essentially same as mT, just penalised for added coefficient
+
+##m2 performs similar to the true values & our calculated offset
+
+```
+
+### site-level
+```{r}
+
+
+obs.df.site <- obs.df %>% group_by(site) %>% summarise(Y = sum(Y), p = mean(p), A = sum(Adelta)) %>% mutate(offset = log(p*A))
+
+m <- glm(Y ~ 1, offset = offset, data = obs.df.site, family = "poisson")
+exp(coef(m))
+Den
+
+
+s1 <- obs.df %>% group_by(site) %>% filter(station == 1) %>% mutate(n.stations = 1) %>% 
+  ungroup() %>% select(site, method, ARU, p, Y, A, Ad = Adelta, n.stations)
+s2 <- obs.df %>% group_by(site, method, ARU, p) %>% filter(station %in% 1:2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta)) %>% mutate(n.stations = 2) %>% ungroup()
+s3 <- obs.df %>% group_by(site, method, ARU, p) %>% filter(station %in% 1:3) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta)) %>% mutate(n.stations = 3) %>% ungroup()
+s4 <- obs.df %>% group_by(site, method, ARU, p) %>% filter(station %in% 1:4) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta)) %>% mutate(n.stations = 4) %>% ungroup()
+s5 <- obs.df %>% group_by(site, method, ARU, p) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta)) %>% mutate(n.stations = 5) %>% ungroup()
+
+s.df <- rbind(s1, s2, s3, s4, s5)
+
+md <- glm(Y ~ 1, offset = log(Ad*(1-exp(-3*phi))), data = s.df, family = "poisson")
+exp(coef(md)) ##predicts density
+Den
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() ##still inherent bias in the data just by chance.  
+
+## don't correct for ARU, just PC area for all
+m <- glm(Y ~ 1, offset = log(A*(1-exp(-max(tint)*phihat))), data = s.df, family = "poisson")
+exp(coef(m)) ## underestimated
+ggplot(cbind(s.df, resid(m)), aes(factor(n.stations), resid(m), fill = factor(n.stations))) + geom_boxplot() ## n. stations corrected for
+ggplot(cbind(s.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not fixed
+
+## use ARU as fixed effect, offset just correcting number of stations
+m1 <- glm(Y ~ ARU, offset = log(n.stations), data = s.df, family = "poisson")
+exp(coef(m1)[1]) ### doesn't predict real density (just relative)
+ggplot(cbind(s.df, resid(m1)), aes(factor(n.stations), resid(m1), fill = n.stations)) + geom_boxplot() ##station effect corrected for
+ggplot(cbind(s.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() ##method effect corrected for
+
+##PC QPad, with ARU fixed effect
+m2 <- glm(Y ~ ARU, offset = log(A*(1-exp(-max(tint)*phihat))), data = s.df, family = "poisson")
+exp(coef(m2)[1]) ## predicts true density
+ggplot(cbind(s.df, resid(m2)), aes(factor(n.stations), resid(m2), fill = factor(n.stations))) + geom_boxplot() ## n. stations corrected for
+ggplot(cbind(s.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot() ##method effect corrected for
+
+mm1 <- glmer(Y ~ (1|ARU), data = s.df, family=poisson, offset= log(n.stations))
+ggplot(cbind(s.df, resid(mm1)), aes(factor(n.stations), resid(mm1), fill = factor(n.stations))) + geom_boxplot() 
+
+mm2 <- glmer(Y ~ (1|ARU), data = s.df, family=poisson, offset=log(A*(1-exp(-max(tint)*phihat))))
+exp(fixef(mm2)) ## doesn't predict density, not sure how this works
+ggplot(cbind(s.df, resid(mm2)), aes(factor(n.stations), resid(mm2), fill = factor(n.stations))) + geom_boxplot()
+
+AIC(md, m, m1, m2, mm1, mm2) %>% arrange(AIC)  ##ARU as fixed effect produces best results, either relative (offset = n.stations) or absolute(QPAD).
+```
+
+# Explore ARU + time effect
+### Survey parameters
+```{r}
+ext = 15 ##1500 x 1500m
+Den = 1.5
+dur1 = 3 ##aru
+dur2 = 10 ##pc
+phi = .5
+tau1 = .85 ## aru, should equal correction factor
+tau2 = 1 ## pc
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+tint1 = 1:3
+tint2 = 1:10
+rint1 = c(.5,1,Inf)
+rint2 = Inf
+```
+
+### make sites
+```{r}
+n.sites <- 150
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #100 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+##PC, 10 min
+surveys <- lapply(sites[1:50], function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+  e <- bsims_animate(site, vocal_rate=phi, duration=max(tint2))## availability during survey at station
+ bsims_detect(e, tau = tau1, xy = loc) ## detections from station
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("pc10.site", 1:50)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+surv.l <- unlist(surveys, recursive = F)
+
+transcribed.pc10 <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint2, rint1))
+
+
+## ARU 3
+surveys <- lapply(sites[51:100], function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+  e <- bsims_animate(site, vocal_rate=phi, duration=max(tint1))## availability during survey at station
+ bsims_detect(e, tau = tau2, xy = loc) ## detections from station
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("aru3.site", 51:100)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+surv.l <- unlist(surveys, recursive = F)
+
+transcribed.aru3 <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint1, rint2))
+
+## ARU 10
+surveys <- lapply(sites[101:150], function(site){ #for each site
+  o.stations.l <- apply(aru_loc, 1, function(loc) {   ## for each station...
+  e <- bsims_animate(site, vocal_rate=phi, duration=max(tint2))## availability during survey at station
+ bsims_detect(e, tau = tau2, xy = loc) ## detections from station
+}) 
+  names(o.stations.l) <- paste0("station", 1:length(aru_loc[,1]))
+o.stations.l
+})
+names(surveys) <- paste0("aru10.site", 51:100)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit
+
+# length(surveys) #n.sites
+# length(surveys[[1]]) #n.stations
+surv.l <- unlist(surveys, recursive = F)
+
+transcribed.aru10 <-lapply(surv.l, function(survey) bsims_transcribe(survey, tint2, rint2))
+
+##ARU surveys have a different tau, and unknown distance bands
+
+transcribed <- c(transcribed.pc10, transcribed.aru3, transcribed.aru10)
+res <- lapply(transcribed, get_table)
+res[1] #pc10
+res[251] #aru3
+res[501] #aru10
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- matrix(tint2, length(res), length(tint2), byrow=TRUE) #time design matrix
+Ddur[251:500, 4:10] <- NA
+Ydur1 <- t(sapply(res[1:250], function(z) colSums(z)))
+Ydur2 <- t(sapply(res[251:500], function(z) colSums(z)))
+Ydur2 <- cbind(Ydur2, matrix(NA, nrow = 250, ncol = 7))
+names(Ydur2) <- names(Ydur1)
+Ydur3 <- t(sapply(res[501:750], function(z) colSums(z)))
+Ydur <- rbind(Ydur1, Ydur2, Ydur3)
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+phihat <- unname(exp(coef(fitp)))
+phihat #estimated
+phi #true
+
+Ddis <- matrix(rint1, length(res[1:250]), length(rint1), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res[1:250], function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau1 #true
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-apply(Ddur, 1, max, na.rm = T)*phihat))
+
+delta2 <- sum(Ydur[501:750])/sum(Ydur[1:250]) 
+## not paired, but we know p and D are the same because we simulated. Use counts of equal length
+delta2 ## estimated
+tau2^2/tau1^2 ## true
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5),
+station = rep(1:5, n.sites),
+Y = sapply(res, sum),
+A = A,
+p = p,
+off = log(A*p),
+method = factor(rep(c("PC", "ARU", "ARU"), each = 250)),
+Dur = factor(rep(c(10,3,10), each = 250))) %>% 
+  mutate(ARU = ifelse(method == "PC", 0, 1),
+         Adelta = ifelse(method == "PC", A, pi*delta2*tauhat^2),
+         AT = ifelse(method == "PC", pi*tau1^2, pi*tau2^2),
+         method2 = paste(method, Dur))
+```
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+##with true scaling factor
+mT <- glm(Y ~ 1, offset = log(AT**p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(mT)), aes(method, resid(mT), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(Dur, resid(mT), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(method2, resid(mT), fill = method2)) + geom_boxplot()
+
+
+##with estimated scaling factor
+md <- glm(Y ~ 1, offset = log(Adelta*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(obs.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(obs.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+
+## No offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+## fixes methodological effects, density not absolute
+
+## Method as fixed effect
+m2 <- glm(Y ~ ARU, offset = off, data = obs.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+
+ggplot(cbind(obs.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2), data = obs.df, family = "poisson")
+
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(off), data = obs.df, family = "poisson")
+
+
+AIC(mT, md, m, m1, m2, mm, mm1) %>% arrange(AIC) ## mT, m1 and m2 essentially same, just different degrees of freedom used
+## Random effect for ARU + method as fixed effect better than method+time as a random effect. 
+
+```
+
+### site-level
+
+```{r}
+
+
+```
+
+```{r}
+s1 <- obs.df %>% group_by(site) %>% filter(station == 1) %>% 
+  mutate(n.stations = 1) %>% ungroup() %>% 
+  select(site, method, ARU, Dur, method2, p, Y, A, Ad = Adelta, AT, n.stations)
+s2 <- obs.df %>% group_by(site, method, ARU, Dur, method2, p) %>% filter(station %in% 1:2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT)) %>% mutate(n.stations = 2) %>% ungroup()
+s3 <- obs.df %>% group_by(site, method, ARU, Dur, method2, p) %>% filter(station %in% 1:3) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT)) %>% mutate(n.stations = 3) %>% ungroup()
+s4 <- obs.df %>% group_by(site, method, ARU, Dur, method2, p) %>% filter(station %in% 1:4) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT)) %>% mutate(n.stations = 4) %>% ungroup()
+s5 <- obs.df %>% group_by(site, method, ARU, Dur, method2, p) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT)) %>% mutate(n.stations = 5) %>% ungroup()
+
+s.df <- rbind(s1, s2, s3, s4, s5)
+
+## actual tau values
+mT <- glm(Y ~ 1, offset = log(AT*p), data = s.df, family = "poisson")
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Ad*p), data = s.df, family = "poisson")
+exp(coef(md))
+ggplot(cbind(s.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(factor(n.stations), resid(md), fill = factor(n.stations))) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(s.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(s.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(factor(n.stations), resid(m), fill = factor(n.stations))) + geom_boxplot() 
+
+## stations offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, offset = log(n.stations), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m1)), aes(factor(n.stations), resid(m1), fill = factor(n.stations))) + geom_boxplot() 
+## fixes methodological effects, density not absolute
+
+## Method as fixed effect
+m2 <- glm(Y ~ ARU, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+ggplot(cbind(s.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(factor(n.stations), resid(m2), fill = factor(n.stations))) + geom_boxplot()
+
+
+## correct for n. sites, not time
+m3 <- glm(Y ~ ARU, offset = log(A), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m3)), aes(method, resid(m3), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(Dur, resid(m3), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m3)), aes(method2, resid(m3), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(factor(n.stations), resid(m3), fill = factor(n.stations))) + geom_boxplot()
+
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2) + offset(log(n.stations)), data = s.df, family = "poisson")
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(log(A*p)), data = s.df, family = "poisson")
+exp(fixef(mm1))
+mm3 <- glmer(Y ~ (1|ARU)+ offset(log(A)), data = s.df, family = "poisson") #doesn't correct for time
+
+AIC(mT, md, m, m1, m2, mm, mm1,  mm3) %>% arrange(AIC) ## m1 (method2 as fixed effect, no p in offset) and m2 (ARU as fixed effect, with p in offset) essentially same, just different degrees of freedom used
+
+```
+
+
+# Time varying Phi - same per site, different among site
+### Survey parameters
+```{r}
+n.sites = 150
+ext = 15 ##1500 x 1500m
+Den = 1.5
+dur1 = 3
+dur2 = 10
+phi = seq(0.3, 0.7, length.out = 5)
+Day = rep(rep(1:5, each = 10), 3)
+phi = phi[Day]
+
+tau <- rep(c(1, .8, .8), each = 50)
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+
+tint <- matrix(1:10, n.sites, 10, byrow=TRUE) #time design matrix
+tint[51:100, 4:10] <- NA
+
+rint <- matrix(c(.5,1,Inf), n.sites, 3, byrow=TRUE) #time design matrix
+rint[51:150, ] <- rep(c(Inf, NA, NA), each = 100)
+```
+
+### make sites
+```{r}
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #150 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+surveys <- list()
+for(i in 1:n.sites){
+  o.stations.l <- list()
+  for(j in 1:5){
+    e = bsims_animate(sites[[i]], vocal_rate = phi[i], duration=max(tint[i,], na.rm = T))
+    o.stations.l[[j]] <- bsims_detect(e, tau = tau[i], xy = aru_loc[j,]) ## detections from station
+  }
+ surveys[[i]] <- o.stations.l
+} 
+  
+names(surveys) <- c(paste0("pc10.site", 1:50), paste0("aru3.site", 1:50), paste0("aru10.site", 1:50))
+
+##sites share the same populated landscape, but have different events/detections for each station and visit. availability(phi) depends on the day that the survey happened.
+
+transcribed <- list()
+for(i in 1:length(surveys)){
+  t <- lapply(surveys[[i]], function(survey) bsims_transcribe(survey, tint[i,], rint[i,]))
+  transcribed[[i]] <- t
+}
+
+names(transcribed) <- c(paste0("pc10.site", 1:50), paste0("aru3.site", 1:50), paste0("aru10.site", 1:50))
+
+transcribed <- unlist(transcribed, recursive = F)
+
+res <- lapply(transcribed, get_table)
+res[1] #pc10
+res[251] #aru3
+res[501] #aru10
+
+
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+day <- rep(Day, each = 5)
+Ddur <- matrix(tint[1,], length(res), length(tint[1,]), byrow=TRUE) #time design matrix
+Ddur[251:500, 4:10] <- NA
+Ydur1 <- t(sapply(res[1:250], function(z) colSums(z)))
+Ydur2 <- t(sapply(res[251:500], function(z) colSums(z)))
+Ydur2 <- cbind(Ydur2, matrix(NA, nrow = 250, ncol = 7))
+names(Ydur2) <- names(Ydur1)
+Ydur3 <- t(sapply(res[501:750], function(z) colSums(z)))
+Ydur <- rbind(Ydur1, Ydur2, Ydur3)
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+fitp1 <- cmulti(Ydur | Ddur ~ day, type="rem")
+AIC(fitp, fitp1) %>% arrange(AIC)
+
+phihat <- drop(exp(model.matrix(fitp1) %*% coef(fitp1)))
+plot(day, phihat)
+mean(phihat)
+mean(phi) 
+
+Ddis <- matrix(rint[1,], length(res[1:250]), length(rint[1,]), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res[1:250], function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau[1] #true
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-apply(Ddur, 1, max, na.rm = T)*phihat)) ## p depends on day
+
+delta2 <- sum(Ydur[501:750])/sum(Ydur[1:250]) 
+## not paired, but we know p and D are the same because we simulated. Use counts of equal length
+delta2 ## estimated
+tau[150]^2/tau[1]^2 ## true
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5),
+station = rep(1:5, n.sites),
+Y = sapply(res, sum),
+A = A,
+p = p,
+day = day,
+tau = rep(tau, each = 5),
+off = log(A*p),
+method = factor(rep(c("PC", "ARU", "ARU"), each = 250)),
+Dur = factor(rep(c(10,3,10), each = 250))) %>% 
+  mutate(ARU = ifelse(method == "PC", 0, 1),
+         AT = pi*tau^2,
+         Adelta = ifelse(method == "PC", A, pi*delta2*tauhat^2),
+         method2 = paste(method, Dur))
+```
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+##with scaling factor
+mT <- glm(Y ~ 1, offset = log(AT*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(mT)), aes(method, resid(mT), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(Dur, resid(mT), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(method2, resid(mT), fill = method2)) + geom_boxplot()
+
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Adelta*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(obs.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(obs.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+
+## No offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+## fixes methodological effects, density not absolute
+ggplot(cbind(obs.df, resid(m1)), aes(factor(day), resid(m1), fill = day)) + geom_boxplot()
+
+## Method as fixed effect, offset uses A (PC) and p (time variable)
+m2 <- glm(Y ~ ARU, offset = off, data = obs.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+
+ggplot(cbind(obs.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(factor(day), resid(m2), fill = day)) + geom_boxplot()
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2), data = obs.df, family = "poisson")
+
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(off), data = obs.df, family = "poisson")
+
+
+AIC(mT, md, m, m1, m2, mm, mm1) %>% arrange(AIC) ## with big difference in p, m2 and m1 are performing similarly, despite variation in p not being accounted for in m2.     
+
+##it appears that p is actually over correcting (pattern in resid for ARU3)
+ggplot(cbind(obs.df, resid(m2)), aes(site, resid(m2))) + geom_point()
+ggplot(cbind(obs.df, resid(m1)), aes(site, resid(m1))) + geom_point()
+ggplot(obs.df %>% filter(site %in% 51:100), aes(p, Y)) + geom_point() + geom_smooth(method = "lm") ## p didn't have a huge effect on Y during these surveys. 
+
+##maybe it will come out in the site-level?
+```
+
+### site-level
+```{r}
+s1 <- obs.df %>% group_by(site) %>% filter(station == 1) %>% 
+  mutate(n.stations = 1) %>% ungroup() %>% 
+  select(site, method, ARU, Dur, method2, Y, A, Ad = Adelta, AT, p, n.stations)
+s2 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 2) %>% ungroup()
+s3 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:3) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 3) %>% ungroup()
+s4 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:4) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 4) %>% ungroup()
+s5 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 5) %>% ungroup()
+
+s.df <- rbind(s1, s2, s3, s4, s5)
+
+## actual tau values
+mT <- glm(Y ~ 1, offset = log(AT*p), data = s.df, family = "poisson")
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Ad*p), data = s.df, family = "poisson")
+exp(coef(md))
+ggplot(cbind(s.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(factor(n.stations), resid(md), fill = factor(n.stations))) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(s.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(s.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(factor(n.stations), resid(m), fill = factor(n.stations))) + geom_boxplot() 
+
+## statoins offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, offset = log(n.stations), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m1)), aes(factor(n.stations), resid(m1), fill = factor(n.stations))) + geom_boxplot() 
+## fixes methodological effects, density not absolute
+
+## Method as fixed effect
+m2 <- glm(Y ~ ARU, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+ggplot(cbind(s.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(factor(n.stations), resid(m2), fill = factor(n.stations))) + geom_boxplot()
+
+
+## correct for n. sites, not time
+m3 <- glm(Y ~ ARU, offset = log(A), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m3)), aes(method, resid(m3), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(Dur, resid(m3), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m3)), aes(method2, resid(m3), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(factor(n.stations), resid(m3), fill = factor(n.stations))) + geom_boxplot()
+
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2) + offset(log(n.stations)), data = s.df, family = "poisson")
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(log(A*p)), data = s.df, family = "poisson")
+exp(fixef(mm1))
+mm3 <- glmer(Y ~ (1|ARU)+ offset(log(A)), data = s.df, family = "poisson") #doesn't correct for time
+
+AIC(mT, md, m, m1, m2, mm, mm1,  mm3) %>% arrange(AIC) ## m2 now better than m1, likely because difference are magnified at the site level. 
+
+```
+
+# Time varying Phi - mix day per site
+### Survey parameters
+```{r}
+n.sites <- 150
+ext = 15 ##1500 x 1500m
+Den = 1.5
+dur1 = 3 #ARU
+dur2 = 10 #PC
+phi = seq(0.4, 0.6, length.out = 5)
+Day = 1:5
+tau1 = .8 #ARU
+tau2 = 1 #PC
+
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+
+tint <- matrix(1:10, n.sites, 10, byrow=TRUE) #time design matrix
+tint[51:100, 4:10] <- NA
+
+rint <- matrix(c(.5,1,Inf), n.sites, 3, byrow=TRUE) #distance design matrix
+rint[51:150, ] <- rep(c(Inf, NA, NA), each = 100)
+```
+
+### make sites
+```{r}
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #150 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+day.l <- list()
+surveys <- list()
+for(i in 1:n.sites){
+  day.i <- sample(Day, 5, replace = T)
+  phi.i <- phi[day.i]
+
+  o.stations.l <- list()
+  for(j in 1:5){
+    e = bsims_animate(sites[[i]], vocal_rate = phi.i[j], duration=max(tint[i,], na.rm = T))
+    o.stations.l[[j]] <- bsims_detect(e, tau = tau[i], xy = aru_loc[j,]) ## detections from station
+  }
+ surveys[[i]] <- o.stations.l
+   day.l[[i]] <- day.i
+} 
+  
+names(surveys) <- c(paste0("pc10.site", 1:50), paste0("aru3.site", 1:50), paste0("aru10.site", 1:50))
+
+##sites share the same populated landscape, but have different events/detections for each station and visit. availability(phi) depends on the day that the survey happened.
+
+transcribed <- list()
+for(i in 1:length(surveys)){
+  t <- lapply(surveys[[i]], function(survey) bsims_transcribe(survey, tint[i,], rint[i,]))
+  transcribed[[i]] <- t
+}
+
+names(transcribed) <- c(paste0("pc10.site", 1:50), paste0("aru3.site", 1:50), paste0("aru10.site", 1:50))
+
+transcribed <- unlist(transcribed, recursive = F)
+
+res <- lapply(transcribed, get_table)
+res[1] #pc10
+res[251] #aru3
+res[501] #aru10
+
+day <- unlist(day.l)
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- matrix(tint[1,], length(res), length(tint[1,]), byrow=TRUE) #time design matrix
+Ddur[251:500, 4:10] <- NA
+Ydur1 <- t(sapply(res[1:250], function(z) colSums(z)))
+Ydur2 <- t(sapply(res[251:500], function(z) colSums(z)))
+Ydur2 <- cbind(Ydur2, matrix(NA, nrow = 250, ncol = 7))
+names(Ydur2) <- names(Ydur1)
+Ydur3 <- t(sapply(res[501:750], function(z) colSums(z)))
+Ydur <- rbind(Ydur1, Ydur2, Ydur3)
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+fitp1 <- cmulti(Ydur | Ddur ~ day, type="rem")
+AIC(fitp, fitp1) %>% arrange(AIC)
+
+phihat <- drop(exp(model.matrix(fitp1) %*% coef(fitp1)))
+plot(day, phihat)
+mean(phihat)
+mean(phi) 
+
+Ddis <- matrix(rint[1,], length(res[1:250]), length(rint[1,]), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res[1:250], function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau[1] #true
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-apply(Ddur, 1, max, na.rm = T)*phihat)) ## p depends on day
+
+delta2 <- sum(Ydur[501:750])/sum(Ydur[1:250]) 
+## not paired, but we know p and D are the same because we simulated. Use counts of equal length
+delta2 ## estimated
+tau[150]^2/tau[1]^2 ## true
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5),
+station = rep(1:5, n.sites),
+Y = sapply(res, sum),
+A = A,
+p = p,
+day = day,
+tau = rep(tau, each = 5),
+off = log(A*p),
+method = factor(rep(c("PC", "ARU", "ARU"), each = 250)),
+Dur = factor(rep(c(10,3,10), each = 250))) %>% 
+  mutate(ARU = ifelse(method == "PC", 0, 1),
+         AT = pi*tau^2,
+         Adelta = ifelse(method == "PC", A, pi*delta2*tauhat^2),
+         method2 = paste(method, Dur))
+```
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+##with scaling factor
+mT <- glm(Y ~ 1, offset = log(AT*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(mT)), aes(method, resid(mT), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(Dur, resid(mT), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(method2, resid(mT), fill = method2)) + geom_boxplot()
+
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Adelta*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(obs.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(obs.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+
+## No offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+## fixes methodological effects, density not absolute
+ggplot(cbind(obs.df, resid(m1)), aes(factor(day), resid(m1), fill = day)) + geom_boxplot()
+
+## Method as fixed effect, offset uses A (PC) and p (time variable)
+m2 <- glm(Y ~ ARU, offset = off, data = obs.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+
+ggplot(cbind(obs.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(factor(day), resid(m2), fill = day)) + geom_boxplot()
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2), data = obs.df, family = "poisson")
+
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(off), data = obs.df, family = "poisson")
+
+
+AIC(mT, md, m, m1, m2, mm, mm1) %>% arrange(AIC) ## mT, m2 essentially same. m1 now performs worse because doesn't account for variability in p
+
+```
+
+### site-level
+```{r}
+s1 <- obs.df %>% group_by(site) %>% filter(station == 1) %>% 
+  mutate(n.stations = 1) %>% ungroup() %>% 
+  select(site, method, ARU, Dur, method2, Y, A, Ad = Adelta, AT, p, n.stations)
+s2 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 2) %>% ungroup()
+s3 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:3) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 3) %>% ungroup()
+s4 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:4) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 4) %>% ungroup()
+s5 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 5) %>% ungroup()
+
+s.df <- rbind(s1, s2, s3, s4, s5)
+
+## actual tau values
+mT <- glm(Y ~ 1, offset = log(AT*p), data = s.df, family = "poisson")
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Ad*p), data = s.df, family = "poisson")
+exp(coef(md))
+ggplot(cbind(s.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(factor(n.stations), resid(md), fill = factor(n.stations))) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(s.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(s.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(factor(n.stations), resid(m), fill = factor(n.stations))) + geom_boxplot() 
+
+## statoins offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, offset = log(n.stations), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m1)), aes(factor(n.stations), resid(m1), fill = factor(n.stations))) + geom_boxplot() 
+## fixes methodological effects, density not absolute
+
+## Method as fixed effect
+m2 <- glm(Y ~ ARU, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+ggplot(cbind(s.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(factor(n.stations), resid(m2), fill = factor(n.stations))) + geom_boxplot()
+
+
+## correct for n. sites, not time
+m3 <- glm(Y ~ ARU, offset = log(A), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m3)), aes(method, resid(m3), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(Dur, resid(m3), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m3)), aes(method2, resid(m3), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(factor(n.stations), resid(m3), fill = factor(n.stations))) + geom_boxplot()
+
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2) + offset(log(n.stations)), data = s.df, family = "poisson")
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(log(A*p)), data = s.df, family = "poisson")
+exp(fixef(mm1))
+mm3 <- glmer(Y ~ (1|ARU)+ offset(log(A)), data = s.df, family = "poisson") #doesn't correct for time
+
+AIC(mT, md, m, m1, m2, mm, mm1,  mm3) %>% arrange(AIC) ## using A*p as offset now better than 
+
+```
+
+# pooled method + time varying Phi 
+### Survey parameters
+```{r}
+n.sites <- 150
+ext = 15 ##1500 x 1500m
+Den = 1.5
+dur1 = 3 #ARU
+dur2 = 10 #PC
+phi = seq(0.4, 0.6, length.out = 5)
+Day = 1:5
+tau1 = .8 #ARU
+tau2 = 1 #PC
+method = c("PC", "ARU")
+aru_loc = matrix(c(-3, 3, 3, 3, 0, 0, -3, -3, 3, -3), byrow = T, ncol = 2)
+
+
+```
+
+### make sites
+```{r}
+sites <- replicate(n=n.sites, bsims_init(extent=ext), simplify = F)  #150 sites
+sites <- lapply(sites, function(site) bsims_populate(site, density = Den))  # populate each landscape
+
+##site true density
+T.den <- sapply(sites, function(a) get_density(a)) 
+hist(T.den)
+
+```
+
+### survey the sites
+```{r}
+day.l <- list()
+method.l <- list()
+surveys <- list()
+for(i in 1:n.sites){
+  day.i <- sample(Day, 5, replace = T)
+  phi.i <- phi[day.i]
+  
+  method.i <- sample(method, 5, replace = T, prob = c(.25, .75))
+  dur.i <- ifelse(method.i == "ARU", dur1, dur2)
+  tau.i <- ifelse(method.i == "ARU", tau1, tau2)
+
+  o.stations.l <- list()
+  for(j in 1:5){
+    e = bsims_animate(sites[[i]], vocal_rate = phi.i[j], 
+                      duration=dur.i[j])
+    o.stations.l[[j]] <- bsims_detect(e, tau = tau.i[j], 
+                                      xy = aru_loc[j,]) ## detections from station
+  }
+ surveys[[i]] <- o.stations.l
+   day.l[[i]] <- day.i
+   method.l[[i]] <- method.i
+} 
+  
+names(surveys) <- paste0("site", 1:150)
+
+##sites share the same populated landscape, but have different events/detections for each station and visit. availability(phi) depends on the day that the survey happened.
+```
+
+##transcribe
+```{r}
+# tint <- matrix(1:10, n.sites, 10, byrow=TRUE) #time design matrix
+# tint[51:100, 4:10] <- NA
+# 
+# rint <- matrix(c(.5,1,Inf), n.sites, 3, byrow=TRUE) #distance design matrix
+# rint[51:150, ] <- rep(c(Inf, NA, NA), each = 100)
+
+
+transcribed <- list()
+for(i in 1:length(surveys)){
+  t <- lapply(surveys[[i]], function(survey) bsims_transcribe(survey, tint[i,], rint[i,]))
+  transcribed[[i]] <- t
+}
+
+names(transcribed) <- c(paste0("pc10.site", 1:50), paste0("aru3.site", 1:50), paste0("aru10.site", 1:50))
+
+transcribed <- unlist(transcribed, recursive = F)
+
+res <- lapply(transcribed, get_table)
+res[1] #pc10
+res[251] #aru3
+res[501] #aru10
+
+day <- unlist(day.l)
+```
+
+### qpad
+Calculate fixed qpad offset
+```{r}
+Ddur <- matrix(tint[1,], length(res), length(tint[1,]), byrow=TRUE) #time design matrix
+Ddur[251:500, 4:10] <- NA
+Ydur1 <- t(sapply(res[1:250], function(z) colSums(z)))
+Ydur2 <- t(sapply(res[251:500], function(z) colSums(z)))
+Ydur2 <- cbind(Ydur2, matrix(NA, nrow = 250, ncol = 7))
+names(Ydur2) <- names(Ydur1)
+Ydur3 <- t(sapply(res[501:750], function(z) colSums(z)))
+Ydur <- rbind(Ydur1, Ydur2, Ydur3)
+fitp <- cmulti(Ydur | Ddur ~ 1, type="rem")
+fitp1 <- cmulti(Ydur | Ddur ~ day, type="rem")
+AIC(fitp, fitp1) %>% arrange(AIC)
+
+phihat <- drop(exp(model.matrix(fitp1) %*% coef(fitp1)))
+plot(day, phihat)
+mean(phihat)
+mean(phi) 
+
+Ddis <- matrix(rint[1,], length(res[1:250]), length(rint[1,]), byrow=TRUE) #infinite distance bins
+Ydis <- t(sapply(res[1:250], function(z) rowSums(z)))
+fitq <- cmulti(Ydis | Ddis ~ 1, type="dis")
+tauhat <- unname(exp(fitq$coef))
+tauhat #estimated
+tau[1] #true
+
+##for 1 station, single visit, pc
+A <- pi * tauhat^2 ## for pc... aru unknown
+p <- (1-exp(-apply(Ddur, 1, max, na.rm = T)*phihat)) ## p depends on day
+
+delta2 <- sum(Ydur[501:750])/sum(Ydur[1:250]) 
+## not paired, but we know p and D are the same because we simulated. Use counts of equal length
+delta2 ## estimated
+tau[150]^2/tau[1]^2 ## true
+```
+
+### Observation df
+df of site, station, visit, and abundance that will be used in glm model.
+```{r}
+obs.df <- data.frame(site = rep(1:n.sites, each = 5),
+station = rep(1:5, n.sites),
+Y = sapply(res, sum),
+A = A,
+p = p,
+day = day,
+tau = rep(tau, each = 5),
+off = log(A*p),
+method = factor(rep(c("PC", "ARU", "ARU"), each = 250)),
+Dur = factor(rep(c(10,3,10), each = 250))) %>% 
+  mutate(ARU = ifelse(method == "PC", 0, 1),
+         AT = pi*tau^2,
+         Adelta = ifelse(method == "PC", A, pi*delta2*tauhat^2),
+         method2 = paste(method, Dur))
+```
+
+### Glms
+Apply to offset as if each count were independent. The offset works well for predicting the true density. 
+```{r}
+##with scaling factor
+mT <- glm(Y ~ 1, offset = log(AT*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(mT)), aes(method, resid(mT), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(Dur, resid(mT), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(mT)), aes(method2, resid(mT), fill = method2)) + geom_boxplot()
+
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Adelta*p), data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = off, data = obs.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(obs.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(obs.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+
+## No offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, data = obs.df, family = "poisson")
+ggplot(cbind(obs.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+## fixes methodological effects, density not absolute
+ggplot(cbind(obs.df, resid(m1)), aes(factor(day), resid(m1), fill = day)) + geom_boxplot()
+
+## Method as fixed effect, offset uses A (PC) and p (time variable)
+m2 <- glm(Y ~ ARU, offset = off, data = obs.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+
+ggplot(cbind(obs.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(obs.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(obs.df, resid(m2)), aes(factor(day), resid(m2), fill = day)) + geom_boxplot()
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2), data = obs.df, family = "poisson")
+
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(off), data = obs.df, family = "poisson")
+
+
+AIC(mT, md, m, m1, m2, mm, mm1) %>% arrange(AIC) ## mT, m2 essentially same. m1 now performs worse because doesn't account for variability in p
+
+```
+
+### site-level
+```{r}
+s1 <- obs.df %>% group_by(site) %>% filter(station == 1) %>% 
+  mutate(n.stations = 1) %>% ungroup() %>% 
+  select(site, method, ARU, Dur, method2, Y, A, Ad = Adelta, AT, p, n.stations)
+s2 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 2) %>% ungroup()
+s3 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:3) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 3) %>% ungroup()
+s4 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% filter(station %in% 1:4) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 4) %>% ungroup()
+s5 <- obs.df %>% group_by(site, method, ARU, Dur, method2) %>% summarise(Y = sum(Y), A = sum(A), Ad = sum(Adelta), AT = sum(AT), p = mean(p)) %>% mutate(n.stations = 5) %>% ungroup()
+
+s.df <- rbind(s1, s2, s3, s4, s5)
+
+## actual tau values
+mT <- glm(Y ~ 1, offset = log(AT*p), data = s.df, family = "poisson")
+
+##with scaling factor
+md <- glm(Y ~ 1, offset = log(Ad*p), data = s.df, family = "poisson")
+exp(coef(md))
+ggplot(cbind(s.df, resid(md)), aes(method, resid(md), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(Dur, resid(md), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(method2, resid(md), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(md)), aes(factor(n.stations), resid(md), fill = factor(n.stations))) + geom_boxplot() 
+
+## Ignoring method effect
+m <- glm(Y ~ 1, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m))
+Den
+ggplot(cbind(s.df, resid(m)), aes(method, resid(m), fill = method)) + geom_boxplot() ##method effect not corrected for
+ggplot(cbind(s.df, resid(m)), aes(Dur, resid(m), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(method2, resid(m), fill = method2)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m)), aes(factor(n.stations), resid(m), fill = factor(n.stations))) + geom_boxplot() 
+
+## statoins offset, method+time as fixed effect
+m1 <- glm(Y ~ method2, offset = log(n.stations), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m1)), aes(method, resid(m1), fill = method)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(Dur, resid(m1), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m1)), aes(method2, resid(m1), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m1)), aes(factor(n.stations), resid(m1), fill = factor(n.stations))) + geom_boxplot() 
+## fixes methodological effects, density not absolute
+
+## Method as fixed effect
+m2 <- glm(Y ~ ARU, offset = log(A*p), data = s.df, family = "poisson")
+exp(coef(m2)[1])
+Den
+exp(coef(m2)[2]) ## essentially calculates delta2
+delta2
+ggplot(cbind(s.df, resid(m2)), aes(method, resid(m2), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(Dur, resid(m2), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m2)), aes(method2, resid(m2), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m2)), aes(factor(n.stations), resid(m2), fill = factor(n.stations))) + geom_boxplot()
+
+
+## correct for n. sites, not time
+m3 <- glm(Y ~ ARU, offset = log(A), data = s.df, family = "poisson")
+ggplot(cbind(s.df, resid(m3)), aes(method, resid(m3), fill = method)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(Dur, resid(m3), fill = Dur)) + geom_boxplot() 
+ggplot(cbind(s.df, resid(m3)), aes(method2, resid(m3), fill = method2)) + geom_boxplot()
+ggplot(cbind(s.df, resid(m3)), aes(factor(n.stations), resid(m3), fill = factor(n.stations))) + geom_boxplot()
+
+
+## Method_time as random effect
+mm <- glmer(Y ~ (1|method2) + offset(log(n.stations)), data = s.df, family = "poisson")
+## Method as random effect, with offset for time
+mm1 <- glmer(Y ~ (1|ARU)+ offset(log(A*p)), data = s.df, family = "poisson")
+exp(fixef(mm1))
+mm3 <- glmer(Y ~ (1|ARU)+ offset(log(A)), data = s.df, family = "poisson") #doesn't correct for time
+
+AIC(mT, md, m, m1, m2, mm, mm1,  mm3) %>% arrange(AIC) ## using A*p as offset now better than 
+
+```

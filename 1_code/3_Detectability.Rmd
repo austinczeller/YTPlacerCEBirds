@@ -1,0 +1,418 @@
+---
+titlD: "3_Detectability"
+author: "Morgan Brown & Austin Zeller"
+datD: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+NAME <- '3_Detectability' ## Name of the R file goes here (without the file extension!)
+PROJECT <- 'Archive' ## Project folder
+PROJECT_DIR <- "E:/Archive" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+
+##Set working directory
+#setwd(file.path(PROJECT_DIR, PROJECT))
+knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
+
+# Set  up pipeline folder if missing
+### The code below will automatically create a pipeline folder for this code file if it does not exist.
+
+if (dir.exists(file.path('empirical', '2_pipeline'))){
+  pipeline <- file.path('empirical', '2_pipeline', NAME)
+} else {
+  pipeline <- file.path('2_pipeline', NAME)
+}
+
+if (!dir.exists(pipeline)) {
+  dir.create(pipeline)
+  for (folder in c('out', 'store', 'tmp')){
+    dir.create(file.path(pipeline, folder))
+  }
+}
+
+
+library(tidyverse)            # data manipulation
+library(sf)
+library(QPAD)
+library(suntools)
+library(intrval)
+library(terra)
+
+
+select <- dplyr::select
+filter <- dplyr::filter
+wd <- getwd()
+```
+
+Load My Data:
+
+```{r}
+counts <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/counts.RDS") ## species detected by survey
+visits <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
+stations <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/sites.RDS") ## coordinates of each station, sf object
+sites <- readRDS("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum_site.RDS") ##includes *SITE* level habitat data, lat/lon/EPSG that could make a sf object if needed
+
+stations <- filter(stations, siteID %in% sites$siteID) ## sites were dropped during habitat summary stage, remove those now. 
+visits <- left_join(stations, visits)
+visits <- filter(visits, !(organization == "WCS" & method == "PC"))
+```
+
+### QPAD Step 1. Load required packages and objects
+
+```{r}
+##move to offsets repository
+setwd("E:/Archive/qpad-offsets-main")
+
+## load v3 estimates
+load_BAM_QPAD(version = 3)
+
+## read raster data
+rlcc <- rast("E:/Archive/qpad-offsets-main/data/lcc.tif")
+rtree <- rast("E:/Archive/qpad-offsets-main/data/tree.tif")
+rtz <- rast("E:/Archive/qpad-offsets-main/data/utcoffset.tif")
+rd1 <- rast("E:/Archive/qpad-offsets-main/data/seedgrow.tif")
+crs <- crs(rtree)
+
+## source functions
+source("E:/Archive/qpad-offsets-main/functions.R")
+```
+
+### Step 2. Define variables for your project
+
+The date/time and coordinate specifications will make sure that required
+predictors are extracted in the way that match the estimates.
+
+-   the species ID need to be a single 4-letter AOU code (see
+    `getBAMspecieslist()` for a full list)
+-   coordinates and timD: can be single values or vectors (shorter
+    objects recycled)
+    -   `dt`: date, ISO 8601 in YYYY-MM-DD (0-padded)
+    -   `tm`: time, ISO 8601 in hh:mm (24 hr clock, 0-padded)
+    -   `lat`: latitude [WGS84 (EPSG: 4326)]
+    -   `lon`: longitude [WGS84 (EPSG: 4326)]
+-   methods descriptors: can be single value or vector (recycled as
+    needed)
+    -   `dur`: duration in minutes
+    -   `dis`: distance in meters
+
+```{r}
+## date and time
+## https://en.wikipedia.org/wiki/ISO_8601
+dt <- as.Date(visits$ts) # ISO 8601 in YYYY-MM-DD (0-padded)
+visits$ts<-ymd_hms(visits$ts)
+
+tm <- strftime(visits$ts, format="%H:%M", tz = "Canada/Yukon") # ISO 8601 in hh:mm (24 hr clock, 0-padded)
+
+## spatial coordinates
+#visits %>% st_transform(crs = "EPSG: 4326") %>% st_coordinates()
+
+lon <- (visits %>% st_transform(crs = "EPSG: 4326") %>% st_coordinates())[,1] # longitude WGS84 (EPSG: 4326)
+lat <- (visits %>% st_transform(crs = "EPSG: 4326") %>% st_coordinates())[,2] # latitude WGS84 (EPSG: 4326)
+
+## point count duration 
+## and truncation distance (Inf for unlimited)
+dur <- visits$dur_min # minutes
+dis <- Inf # meters
+
+
+project <- terra::project
+x <- make_x(dt, tm, lon, lat, dur, dis)
+str(x)
+# missing.lcc <- visits[is.na(x$LCC2),] %>% select(siteID, station) %>% distinct() %>% st_transform(crs = crs(rlcc))
+# st_bbox(missing.lcc)
+# library(tidyterra)
+# ggplot(missing.lcc) + geom_spatraster(data = rlcc) + 
+#   geom_sf(col = "red") +
+#   coord_sf(xlim = c(-1955673, -1781491), ylim = c(8758407, 8995982))
+
+```
+
+### QPAD Step 3. Calculate offsets
+
+`A` is the known or estimated area of survey, `p` is availability given
+presence, `q` is detectability given avaibalility.
+
+NOTD: `offset` is `log(correction)`, `correction` = `A*p*q`, thus
+`offset=log(A) + log(p) + log(q)`.
+
+Use a loop over multiple species:
+
+Singing rates of birds vary with time of day, time of year, breeding
+status, and stage of the nesting cycle. Thus, removal model estimates of
+availability may be improved by accounting for variation in singing
+rates using covariates for day of year and time of day. In this case
+$p(t_{iJ}) = 1 - e^{-t_{iJ} \phi_{i}}$ and
+$log(\phi_{i}) = \beta_{0} + \sum^{K}_{k=1} \beta_{k} x_{ik}$ is the
+linear predictor with $K$ covariates and the corresponding unknown
+coefficients ($\beta_{k}$, $k = 0,\ldots, K$).
+
+$q$ = average probability of detecting individuals within the surveyed
+area. Probability of detecting an event (i.e. a song) decreases with
+distance from the observer. - The distance function ($g(d)$) describes
+the probability of detecting an individual given the distance between
+the observer and the individual ($d$). - Assuming birds are equally
+distributed throughout the landscape, the area within further distance
+bands is larger (bigger rings) and so should contain more birds. The
+number of birds at distance $d$ is represented by $h(d)$ (i.e. the true
+distribution of individuals) - The product $g(d) h(d)$ gives the density
+function of the *observed distances*. (i.e. this is the distribution of
+individuals that an observer could detect) - The average probability of
+detecting individuals within a circle truncated at $r_{max}$
+($q(r_{max})$) is the integral of
+$g(d) h(d)$:$q(r_{max})=\int_{0}^{r_{max}} g(d) h(d) dd$.
+
+The known `A`rea, `p`, and `q` together make up the correction factor,
+which is used to estimate density based on
+$\hat{D}=Y/(A \hat{p}\hat{q})$
+
+Most surveys are not truncated however (detections could go, in theory,
+up to Inf).
+
+In case of the Half-Normal distance function, $\tau$ is the *effective
+detection radius* (EDR). The effective detection radius is the distance
+from observer where the number of individuals missed within EDR (volume
+of 'air' above black within blue) equals the number of individuals
+detected outside of EDR (dough volume outside the cookie cutter), EDR is
+the radius $r_e$ where $q(r_e)=\pi(r_e)$ We can use EDR (`tauhat` for
+Half-Normal) and calculate the estimated effective area sampled (`Ahat`;
+$\hat{A}=\pi \hat{\tau}^2$). We can also set `q` to be 1, because the
+logic behind EDR is that its volume equals the volume of the integral,
+in other words, it is an area that would give on average same count
+under perfect detection. Thus, we can estimate density using
+$\hat{D}=Y/(\hat{A} \hat{p}1)$
+
+```{r}
+SPP <- getBAMspecieslist()
+
+OFF <- matrix(0, nrow(x), length(SPP))
+rownames(OFF) <- rownames(x) # your survey IDs here
+colnames(OFF) <- SPP
+
+A <- matrix(0, nrow(x), length(SPP))
+rownames(A) <- rownames(x) # your survey IDs here
+colnames(A) <- SPP
+
+p <- matrix(0, nrow(x), length(SPP))
+rownames(p) <- rownames(x) # your survey IDs here
+colnames(p) <- SPP
+
+for (spp in SPP) {
+  cat(spp, "\n")
+  o <- make_off(spp, x)
+  OFF[,spp] <- o$correction ##p*q*A
+  A[,spp] <- o$A
+  p[,spp] <- o$p
+}
+str(OFF)
+##num [1, 1:151] 0.1365 0.9699 0.0643 0.5917 -0.3132 ...
+## - attr(*, "dimnames")=List of 2
+##  ..$ : chr "17"
+##  ..$ : chr [1:151] "ALFL" "AMCR" "AMGO" "AMPI" ...
+
+OFF[is.na(x$LCC2),]
+
+A <- cbind(visits %>% st_drop_geometry() %>% select(siteID, station, ts, method), as.data.frame(A))
+p <- cbind(visits %>% st_drop_geometry() %>% select(siteID, station, ts, method), as.data.frame(p))
+OFF <- cbind(visits %>% st_drop_geometry() %>% select(siteID, station, ts, method), as.data.frame(OFF))
+
+setwd(wd)
+```
+
+## ARU scaling constant
+
+If we take the scaling constant from other studies, we can correct A for
+aru methods and combine across aru methodology. e.g. sum of A for pcs,
+and A\*delta for arus.
+
+Scaling constants were only found for half the studies, and most species
+overlapped 0. Better to use % of surveys (or time?) that were aru as a
+fixed factor to correct for different methodologies, and hope it drops
+out with AIC.
+
+## Environmental Noise
+
+Number of tags on a recording decreases with noise (from wind, industry,
+rivers, etc.) THe amount of obstruction will likely depend on sound
+qualities of a species' song/call, but we can try to calculate and apply
+an overall reduction in detection across all species as part of the
+offset.
+
+The only other approach is to try and summarise the average noise at a
+site, which will require either assigning and averaging a numeric noise
+'value' or take the modal noise level across all visits, for which we
+can estimate a model parameter by species.
+
+```{r}
+
+counts$ts<-ymd_hms(counts$ts)
+task <- left_join(counts %>% group_by(siteID, station, ts) %>% summarise(n.tags = sum(abundance)), 
+                  visits %>% st_drop_geometry() %>% select(siteID, station, ts, obsNoise, dur, observer)) %>%
+  filter(dur == 18 & !(is.na(obsNoise))) %>% mutate(year = as.factor(year(ts)))
+## 'Unk' obs Noise removed because these were all from ECCC point counts 
+
+##FOR SOME REASON dur is 18 instead of 180 this might change if once we finish 2024
+
+ggplot(task, aes(obsNoise, n.tags)) + geom_boxplot() ## very weird that "none' is lower than light and moderate
+
+ggplot(task, 
+       aes(obsNoise, n.tags, fill = year)) + geom_boxplot() ## noise change is a lot more clear in 2023 and 2018 than compared to other years.  No high noise sites in 2017 and overall lower counts...  This might change when more 2021 data is revised
+ggplot(task, 
+       aes(obsNoise, n.tags, fill = observer)) + geom_boxplot()
+
+table(task$obsNoise, task$year) ## lots of 'none' noise in 2017... could be responsible for skew
+
+## combine none and light
+task %>% group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags), med.tags = median(n.tags))
+task %>% filter(year != 2017) %>% 
+  group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags), med.tags = median(n.tags)) #'none' still lower
+
+task %>% filter(year != 2017) %>% mutate(Noise = ifelse(obsNoise == "Heavy", "Heavy",
+                                   ifelse(obsNoise == "Moderate", "Moderate", "Light")))  %>% 
+  group_by(Noise) %>% summarise(mn.tags = mean(n.tags)) ##must not be many sites because distance is marginal
+
+task <- task %>% mutate(Noise = ifelse(obsNoise == "Heavy", "Heavy",
+ifelse(obsNoise == "Moderate", "Moderate", "Light")))
+table(task$Noise, task$year) 
+
+noise.effect <- task %>% group_by(Noise) %>% summarise(mn.tags = mean(n.tags))
+
+light.mn <- noise.effect[noise.effect$Noise == "Light", ]$mn.tags
+noise.effect$ratio <- noise.effect$mn.tags/light.mn
+noise.effect$noise_rank <- light.mn/noise.effect$mn.tags
+
+## Is station noise consistent?
+# tmp <- visits %>% group_by(siteID, station) %>% 
+#   summarise(noise.h = sum(obsNoise == "Heavy"),
+#             noise.m = sum(obsNoise == "Moderate"),
+#             n.visits = n()) %>%
+#   mutate(noise.l = n.visits - noise.h - noise.m)
+# 
+# filter(tmp, (noise.h >0 & noise.h < n.visits) | 
+#          (noise.m >0 & noise.m < n.visits))  ##129/898 stations have variation in noise (14%)
+# 
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+noise.effect$Noise<-as.character(noise.effect$Noise)
+
+### Unk, None, and Light are all grouped together as "Light"
+noise.df <- visits  %>% st_drop_geometry() %>%
+  mutate(Noise = ifelse(obsNoise == "Moderate", "Moderate",
+                                             ifelse(obsNoise == "Heavy", "Heavy", "Light"))) %>%
+  mutate(Noise = ifelse(is.na(Noise), "Light", Noise)) %>% 
+  left_join(noise.effect %>% select(Noise, noise_rank)) %>%
+  group_by(siteID) %>% summarise(noise.tag.abun = mean(noise_rank),
+                                 noise.linear = mean(ifelse(Noise == "Light", 1, 
+                                                       ifelse(Noise == "Moderate", 2, 3))),
+                                 noise.sq = mean(ifelse(Noise == "Light", 1, 
+                                                       ifelse(Noise == "Moderate", 4, 9))),
+                                 noise.mode = as.factor(getmode(Noise))) 
+
+#hist(noise.df$noise.tag.abun) 
+#hist(noise.df$noise.linear) 
+#hist(noise.df$noise.sq)
+
+#plot(scale(noise.df$noise.linear), scale(noise.df$noise.tag.abun))## tag abundance penalizes heavy more than moderate
+#plot(scale(noise.df$noise.sq), scale(noise.df$noise.tag.abun))## tag abundance penalizes heavy more than moderate
+#plot(scale(noise.df$noise.linear), scale(noise.df$noise.sq))### sq penalizes heavy more than moderate
+
+ggplot(noise.df, aes(noise.mode, noise.linear)) + geom_boxplot() #not much overlap between different modes
+ggplot(noise.df, aes(noise.mode, noise.sq)) + geom_boxplot() #not much overlap between different modes
+ggplot(noise.df, aes(noise.mode, noise.tag.abun)) + geom_boxplot() # some overlap between light and moderate. 
+```
+
+## SUM offsets over counts in a site.
+
+**Note** Because we are using EDR, q is always 1, so only need to focus
+on p and A.
+
+-   effected detection radius/survey area (A) for each visit can be
+    summed and used as the site-level estimated survey area. (Mahon et
+    al 2019) (i.e. add area even for repeated counts, this is the same
+    as multiplying by log(n.visits) while correcting for area surveyed
+    at each station)
+-   p (availability) can be averaged over stations, or we can just use
+    time-invariant phi. Simulations showed that generally at the site
+    level the time-variation in phi averaged out. BUT! q also depends on
+    duration, so it should be accounted for.
+
+off2 = sum(A)*mean(p) off = sum(A*p)
+
+Counts should then be summed across visits/station in a site (and
+different n.visits/n.stations are corrected for by A, and different
+durations are corrected for by p)
+
+**NotD:** currently this is also combining ARU and PC methodologies, so
+can't correct with a fixed factor. May have to also group by method, and
+choose method with highest prob of detection per site?
+
+```{r}
+perARU <- data.frame(A) %>% group_by(siteID) %>% summarise(n.visits = n(), n.ARU = sum(method == "ARU"), 
+                                             perARU = n.ARU/n.visits)
+
+# names(A %>% select(-siteID, -station, -ts, -method))
+OFF <- group_by(OFF, siteID) %>% select(-station, -ts, -method) %>% summarise(across(where(is.numeric), sum)) %>% ungroup()
+A <- group_by(A, siteID) %>% select(-station, -ts, -method) %>% summarise(across(where(is.numeric), sum)) %>% ungroup()
+p <- group_by(p, siteID) %>% select(-station, -ts, -method) %>% summarise(across(ALFL:YTVI, mean)) %>% ungroup()
+siteID.v <- A$siteID
+A <- as.matrix(A %>% select(-siteID))
+p <- as.matrix(p %>% select(-siteID))
+
+off <- OFF %>% mutate_if(is.numeric, log)
+off2 <- log(A*p)
+off2 <- cbind(siteID = siteID.v,  as.data.frame(off))
+
+table(duplicated(off$siteID)) ## ARU and PC sites combined so no duplication
+#notD: WCS PCs already removed.  COuld probably keep chris' if we ever add 2023 PC data. 
+
+
+```
+
+## filter correct species
+
+```{r}
+spec.select <- counts %>% filter(siteID %in% visits$siteID & !largeHR) %>% 
+  select(siteID, species_code) %>% distinct() %>%
+  group_by(species_code) %>% summarise(n.sites = n(), p.sites = n.sites/length(siteID.v))
+
+
+spec.select <- filter(spec.select, p.sites > .1) %>% pull(species_code)
+
+spec.select[!spec.select %in% names(off)] ## missing offsets for CAJA and CORE
+
+off <- select(off, siteID,  names(off)[names(off) %in% spec.select])
+```
+
+## summarise site abundance and add offsets
+
+```{r}
+counts <- counts %>% group_by(siteID, species_code) %>%
+  summarise(abundance = sum(abundance)) %>% 
+  filter(species_code %in% spec.select) 
+
+off <- off %>% pivot_longer(!c(siteID), names_to = "species_code", values_to = "offset")
+
+counts <- left_join(off, counts) %>% 
+  mutate_if(is.numeric,coalesce,0)  %>% #drops CAJA and CORE, because missing offsets
+  left_join(perARU %>% select(siteID, perARU)) %>%
+  left_join(noise.df)
+
+#371499-B only had 1, 3min ARU, so a effort outlier
+
+filter(counts, species_code == "AMRO" & siteID != "371499-B") %>% 
+  ggplot(aes(exp(offset), abundance)) + geom_point() + geom_smooth()
+filter(counts, species_code == "DEJU"& siteID != "371499-B") %>% ggplot(aes(exp(offset), abundance)) + geom_point() + geom_smooth() 
+## Abundance increases with offset (i.e. more individuals detected if higher probability of detection/more surveys)
+
+saveRDS(counts, file.path("E:/Archive",pipeline, "out", "sitelevel_counts.RDS"))
+```
+
+Checked site-pooling logic with bsims - this seems like a good
+approach.- see bsims_multivisit_multistation.Rmd
