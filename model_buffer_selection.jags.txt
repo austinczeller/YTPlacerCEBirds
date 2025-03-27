@@ -1,0 +1,18 @@
+model {
+  # Priors for the intercept
+  alpha ~ dnorm(0, 1e-2)
+  
+  # Priors for buffer selection and coefficients
+  for (j in 1:ncovs) {  # for each buffer-variable combination
+    ind_beta[j] ~ dbern(bp[j])
+    bp[j] ~ dbeta(1, 1)  # Uniform prior for inclusion probability
+    beta[j] ~ dnorm(0, 1e-2)  # Coefficient for each covariate-buffer
+    expo[j] ~ dunif(-3, 3)  # Exponent for non-linearity
+  }
+  
+  # Likelihood
+  for (i in 1:nobs) {
+    y[i] ~ dpois(lambda[i])
+    log(lambda[i]) <- alpha + inprod(beta[], (cov[i, ] ^ expo[])) + log(offset[i])
+  }
+}

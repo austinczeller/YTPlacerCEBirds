@@ -1,0 +1,16 @@
+model {
+  # Priors for the intercept and covariate coefficients
+  alpha ~ dnorm(0, 1e-2)
+  for (q in 1:ncovs) {
+    beta[q] ~ dnorm(0, 1e-2)
+  }
+
+  # Likelihood for the observed data
+  for (i in 1:nobs) {
+    # Poisson likelihood for the response variable
+    y[i] ~ dpois(lambda[i])
+
+    # Log link function incorporating covariates
+    log(lambda[i]) <- offset[i] + alpha + inprod(beta[], cov[i,])
+  }
+}

@@ -1,0 +1,21 @@
+model {
+  # Likelihood
+  for (i in 1:nobs) {
+    y[i] ~ dpois(lambda[i])
+    log(lambda[i]) <- log(offset[i]) + inprod(beta[], cov[i, ]) + site_effect[siteID[i]]
+  }
+  
+  # Random effects for sites
+  for (s in 1:n_sites) {
+    site_effect[s] ~ dnorm(0, tau_site)
+  }
+  
+  # Priors for fixed effects
+  for (j in 1:ncovs) {
+    beta[j] ~ dnorm(0, 0.001)
+  }
+  
+  # Prior for site random effect precision
+  tau_site <- pow(sigma_site, -2)
+  sigma_site ~ dunif(0, 10)
+}
