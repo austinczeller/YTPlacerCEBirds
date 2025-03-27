@@ -10,7 +10,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 NAME <- '4_DataExploration' ## Name of the R file goes here (without the file extension!)
 PROJECT <- 'Archive' ## Project folder
-PROJECT_DIR <- "E:/CE_analysis" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+PROJECT_DIR <- "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
 
 ##Set working directory
 #setwd(file.path(PROJECT_DIR, PROJECT))
@@ -76,19 +76,24 @@ Set up count matrix
 
 ```{r}
 # ##summed per site
-hab.sum <- read_rds("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum_site.RDS")
-counts <- read_rds("E:/Archive/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
+hab.sum <- read_rds("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/2_HabitatSum/out/hab_sum_site.RDS")%>%filter(year!=0)
+counts <- read_rds("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
 #less common species already removed (must have been detected at 20% of sites)
 
 hab.sum <- filter(hab.sum, wetland.layer & siteID != "371499-B") ## only use sites with wetland layer to see if important, 371499-B had no detections and only has 1, 3min ARU recording. 
-hab.sum<-hab.sum%>%filter(siteID%in%counts$siteID)%>%filter(buffer=="500")
+hab.sum<-hab.sum%>%
+  filter(siteID%in%counts$siteID)
 
-counts <- filter(counts, siteID %in% hab.sum$siteID) ## no detections
+hab.sum1000<-hab.sum%>%filter(buffer=="1000")
+hab.sum150<-hab.sum%>%filter(buffer=="150")
+hab.sum500<-hab.sum%>%filter(buffer=="500")
+
+counts <- filter(counts, siteID %in% hab.sum500$siteID) ## no detections
 
 counts.m <- pivot_wider(counts, id_cols = siteID,
                         names_from=species_code,
                         values_from = abundance, values_fill = 0)
-all.equal(unique(hab.sum$siteID), rownames(counts.m))
+all.equal(unique(hab.sum500$siteID), rownames(counts.m))
  tmp <- as.matrix(counts.m[,2:length(counts.m[1,])])
  rownames(tmp) <- counts.m$siteID
  counts.m <- tmp
@@ -107,9 +112,14 @@ hab.sum$h_open <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_lo
                                      "h_barren", "h_herb", "h_sparce_veg", "h_tussock_tundra",
                                      "h_burn-herb", "h_burn-shrub", "h_burn-sappling")])
 
+hab.sum1000<-hab.sum%>%filter(buffer=="1000")
+hab.sum150<-hab.sum%>%filter(buffer=="150")
+hab.sum500<-hab.sum%>%filter(buffer=="500")
+
+
 ord <- cca(counts.m ~ h_open + h_forest + h_wet + d_surface + wden + 
              elev + lat + lon, 
-           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+           data = hab.sum500)
 ord 
 plot(ord) 
 plot(ord, display = "sp") #h_wet less important
@@ -117,7 +127,7 @@ plot(ord, display = "sp") #h_wet less important
 ##what about nasa fens and bogs? group with open?
 ord1 <- cca(counts.m ~ h_open + h_forest +  d_surface  + h_fen_nasa +h_bog_nasa +
              elev + lat + lon, 
-           data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
+           data = hab.sum %>% filter(buffer == 500 & wetland.layer & siteID != "371499-B"))
 plot(ord1) 
 plot(ord, display = "sp") #h_wet less important
 
@@ -125,6 +135,7 @@ hab.sum$h_open <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_lo
                                      "h_barren", "h_herb", "h_sparce_veg", "h_tussock_tundra",
                                      "h_burn-herb", "h_burn-shrub", "h_burn-sappling",
                                      "h_fen_nasa", "h_bog_nasa")])
+#THE ABOVE LINE ADdS FENS AND BOGS TO OPEN^^^
 
 ```
 
@@ -191,8 +202,8 @@ plot(ord_open2, display = "sp")
 
 ## burn herb is coming out as distinct - try grouping all burns together to see if it improves
 hab.sum$h_burn <- rowSums(hab.sum[,c("h_burn-shrub","h_burn-herb", "h_burn-sappling")])
-filter(hab.sum, buffer == 150) %>% pull(h_burn) %>% hist ## not a great gradient
-table(filter(hab.sum, buffer == 150) %>% pull(h_burn) > 0.1) ## 18/145, 12% of sites > 10% burned
+#filter(hab.sum, buffer == 150) %>% pull(h_burn) %>% hist() ## not a great gradient
+#table(filter(hab.sum, buffer == 150) %>% pull(h_burn)) ## 18/145, 12% of sites > 10% burned
 
 hab.sum$h_open_noburn <- rowSums(hab.sum[,c("h_shrub_tall", "h_shrub_open", "h_shrub_low", 
                                             "h_bog_nasa", "h_fen_nasa",
@@ -272,10 +283,12 @@ ord_d <- cca(counts.m ~ h_open  + h_forest + h_wet + wden_high +
              elev + lat + lon, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
 ord_d 
 plot(ord_d) ## all closely grouped
+plot(ord_d, display="sp")
 
 ord_d1 <- cca(counts.m ~ d_pBare + d_pVeg + d_wet + d_lden_r + d_lden_c + d_lden_t, data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B"))
 ord_d1 
 plot(ord_d1) ## Cutlines and trails are more similar than roads
+plot(ord_d1,display="sp")
 
 ## Vegetated vs unvegetated features....
 
@@ -311,7 +324,7 @@ ord_clim
 plot(ord_clim)
 
 #plot(cca(counts.m ~ mn_june_tmax + mn_june_tmin + mn_june_precip + mn_total_precip + mn_last_snow, 
-                data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B")))
+#                data = hab.sum %>% filter(buffer == 150 & wetland.layer & siteID != "371499-B")))
 
 
 #cor(hab.sum$mn_june_tmax, hab.sum$mn_june_tmin) #highly correlated
@@ -506,6 +519,15 @@ hab.vars <- c("h_wet","h_woodland",
 hab.sum$habclass <- apply(hab.sum[, hab.vars], 1, function(x){
   sub('..','', names(x)[x==max(x)]) ##sub: match first 3 characters, replace with nothing
   })
+
+hab.sum <- hab.sum %>%
+  mutate(habclass = gsub('c\\("wet,"wet"\\)', "wet", habclass))
+hab.sum<-hab.sum%>%mutate(habclass = ifelse(habclass == 'c("wet", "wet")', "wet", habclass))
+
+
+# Check if the changes were applied
+print(unique(hab.sum$habclass))
+
 sort(table(hab.sum$habclass)) ##only 2 primarily disturbed sites
 ggplot(hab.sum, aes(habclass)) + geom_bar() + ylab('Number of Sites') + xlab("Habitat Class")
 
@@ -539,7 +561,7 @@ pairs(hab.sum %>% filter(buffer == 150) %>% ungroup() %>%
 
 
 
-pairs(hab.sum %>% filter(buffer == 1000) %>% select(d_surface, d_lden_all, h_forest, h_open, h_wet,  wden, mn_june_tmin,  elev, lat, lon),
+pairs(hab.sum %>% filter(buffer == 1000) %>% select(d_surface, d_lden_all, h_forest, h_open, h_wet,  wden,  elev, lat, lon),
       upper.panel=panel.smooth,
       diag.panel = panel.hist,
       lower.panel=panel.cor, cex.labels=1.5) ## forest and open are also highly correlated, and surface vs linear disturbance are correlated at larger scale. 
@@ -562,7 +584,7 @@ Appendix of `Landscape composition is more important than local vegetation struc
 
 ```{r}
 ### Reload, some filtering used for cca doesn't apply
-counts <- read_rds("E:/Archive/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
+counts <- read_rds("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/3_Detectability/out/sitelevel_counts.RDS")
 counts <- filter(counts, siteID %in% hab.sum$siteID) ## no detections
 scaled.vars <- hab.sum %>% select(starts_with("h_"), starts_with("d_"), starts_with("wden")) %>% colnames()
 ## for species detected at between 10 - 25% of sites, could try P/A models
@@ -573,13 +595,13 @@ tmp <- sapply(counts.spec, function(x) {
   sum(x$abundance > 0)
 }) 
 n.sites <- length(unique(hab.sum$siteID))
-tmp[tmp<.20*n.sites] ## will loose all the SAR species. 
+tmp[tmp<.15*n.sites] ## will loose all the SAR species. 
 tmp[tmp> .75*n.sites] ##require birds to be detected at <80% of sites? For abundance, highend shouldn't matter 
-counts.spec <- counts.spec[tmp>.2*n.sites] ##require species to be detected at > 20% of sites (29) 
+counts.spec <- counts.spec[tmp>.15*n.sites] ##require species to be detected at > 15% of sites 
 
 counts.spec <- lapply(counts.spec, function(x) inner_join(x, hab.sum %>% filter(wetland.layer & siteID != "371499-B")))
 
-source("E:/Archive/1_code/multifit.R") ##https://doi.org/10.1007/s10980-018-0657-5;  https://github.com/phuais/multifit/blob/master/multifit.R,
+source("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/1_code/multifit.R") ##https://doi.org/10.1007/s10980-018-0657-5;  https://github.com/phuais/multifit/blob/master/multifit.R,
 var.sel <- data.frame(variable = NULL, buffer = NULL)
 counts.l <- list()
 for(x in 1:length(counts.spec)){
@@ -637,16 +659,16 @@ names(counts.l) <- names(counts.spec)
 counts.l <- counts.l[!sapply(counts.l, is.null)] ## no TOSO models converged
 par(mfrow = c(1,1))
 
-saveRDS(counts.l, file.path(pipeline, "store", "counts_scaled.rds"))
-saveRDS(var.sel, file.path(pipeline, "store", "selected_scales.rds"))
+saveRDS(counts.l, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "counts_scaled.rds"))
+saveRDS(var.sel, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "selected_scales.rds"))
 
 ```
 
 Both low and high buffers are being selected. Check how correlated these are, will it matter? Would be cleaner if we could focus on just 2 scales.
 
 ```{r}
-counts.l <- readRDS(file.path("E:/Archive",pipeline, "store", "counts_scaled.rds"))
-var.sel <- readRDS(file.path("E:/Archive",pipeline, "store", "selected_scales.rds"))
+counts.l <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "counts_scaled.rds"))
+var.sel <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "selected_scales.rds"))
 
 var.sel$buffer <- as.numeric(var.sel$buffer)
 table(var.sel$buffer)
@@ -771,7 +793,7 @@ best models is almost always negbin. The only ZIP/ZINB selected were for species
 # Save simplified counts and hab.sum for modeling
 
 ```{r}
-saveRDS(counts.spec, file.path("E:/Archive",pipeline, "store", "counts_simp.RDS"))
-saveRDS(hab.sum, file.path("E:/Archive",pipeline, "store", "hab.sum_simp.RDS"))
+saveRDS(counts.spec, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "counts_simp.RDS"))
+saveRDS(hab.sum, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "hab.sum_simp.RDS"))
 
 ```

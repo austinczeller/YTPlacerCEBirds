@@ -13,7 +13,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 NAME <- '3_Detectability' ## Name of the R file goes here (without the file extension!)
 PROJECT <- 'Archive' ## Project folder
-PROJECT_DIR <- "E:/Archive" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+PROJECT_DIR <- "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
 
 ##Set working directory
 #setwd(file.path(PROJECT_DIR, PROJECT))
@@ -52,34 +52,40 @@ wd <- getwd()
 Load My Data:
 
 ```{r}
-counts <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/counts.RDS") ## species detected by survey
-visits <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
-stations <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/sites.RDS") ## coordinates of each station, sf object
-sites <- readRDS("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum_site.RDS") ##includes *SITE* level habitat data, lat/lon/EPSG that could make a sf object if needed
+counts <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/out/counts.RDS") ## species detected by survey
+visits <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
+stations <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/out/sites.RDS") ## coordinates of each station, sf object
+sites <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/2_HabitatSum/out/hab_sum.RDS") ##includes *SITE* level habitat data, lat/lon/EPSG that could make a sf object if needed
 
 stations <- filter(stations, siteID %in% sites$siteID) ## sites were dropped during habitat summary stage, remove those now. 
 visits <- left_join(stations, visits)
 visits <- filter(visits, !(organization == "WCS" & method == "PC"))
+
+
+visits <- visits %>%
+  mutate(dur = ifelse(dur == 6, 60, dur))%>%mutate(dur=ifelse(dur==18,180,dur))%>%
+  mutate(dur_min=ifelse(dur_min==.1,1,dur_min))%>%mutate(dur_min=ifelse(dur_min==.3,3,dur_min))%>%mutate(dur=ifelse(dur==30,300,dur))%>%mutate(dur_min==ifelse(dur_min==.5,5,dur_min))
+
 ```
 
 ### QPAD Step 1. Load required packages and objects
 
 ```{r}
 ##move to offsets repository
-setwd("E:/Archive/qpad-offsets-main")
+setwd("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main")
 
 ## load v3 estimates
 load_BAM_QPAD(version = 3)
 
 ## read raster data
-rlcc <- rast("E:/Archive/qpad-offsets-main/data/lcc.tif")
-rtree <- rast("E:/Archive/qpad-offsets-main/data/tree.tif")
-rtz <- rast("E:/Archive/qpad-offsets-main/data/utcoffset.tif")
-rd1 <- rast("E:/Archive/qpad-offsets-main/data/seedgrow.tif")
+rlcc <- rast("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main/data/lcc.tif")
+rtree <- rast("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main/data/tree.tif")
+rtz <- rast("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main/data/utcoffset.tif")
+rd1 <- rast("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main/data/seedgrow.tif")
 crs <- crs(rtree)
 
 ## source functions
-source("E:/Archive/qpad-offsets-main/functions.R")
+source("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/qpad-offsets-main/functions.R")
 ```
 
 ### Step 2. Define variables for your project
@@ -132,7 +138,7 @@ str(x)
 
 ```
 
-### QPAD Step 3. Calculate offsets
+### \<\>QPAD Step 3. Calculate offsets
 
 `A` is the known or estimated area of survey, `p` is availability given
 presence, `q` is detectability given avaibalility.
@@ -248,11 +254,15 @@ site, which will require either assigning and averaging a numeric noise
 can estimate a model parameter by species.
 
 ```{r}
+counts<-counts%>%filter(!is.na(ts))
+counts2<-counts%>%group_by(siteID,station,ts)%>%summarise(n.tags=sum(abundance))
+visits<-visits%>%st_drop_geometry()%>% select(siteID, station, ts, obsNoise, dur, observer)
+#counts$ts<-ymd_hms(counts$ts)
+task <- left_join(visits,counts2) 
+task<-task%>%filter(!is.na(ts))%>%mutate(year=year(ts))
 
-counts$ts<-ymd_hms(counts$ts)
-task <- left_join(counts %>% group_by(siteID, station, ts) %>% summarise(n.tags = sum(abundance)), 
-                  visits %>% st_drop_geometry() %>% select(siteID, station, ts, obsNoise, dur, observer)) %>%
-  filter(dur == 18 & !(is.na(obsNoise))) %>% mutate(year = as.factor(year(ts)))
+#%>%
+#  filter(dur == 18 & !(is.na(obsNoise))) %>% mutate(year = as.factor(year(ts)))
 ## 'Unk' obs Noise removed because these were all from ECCC point counts 
 
 ##FOR SOME REASON dur is 18 instead of 180 this might change if once we finish 2024
@@ -267,21 +277,23 @@ ggplot(task,
 table(task$obsNoise, task$year) ## lots of 'none' noise in 2017... could be responsible for skew
 
 ## combine none and light
-task %>% group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags), med.tags = median(n.tags))
+task %>% group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags,na.rm=T), med.tags = median(n.tags,na.rm=T))
+
 task %>% filter(year != 2017) %>% 
-  group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags), med.tags = median(n.tags)) #'none' still lower
+  group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags,na.rm=T), med.tags = median(n.tags,na.rm=T)) #'none' still lower
 
 task %>% filter(year != 2017) %>% mutate(Noise = ifelse(obsNoise == "Heavy", "Heavy",
                                    ifelse(obsNoise == "Moderate", "Moderate", "Light")))  %>% 
-  group_by(Noise) %>% summarise(mn.tags = mean(n.tags)) ##must not be many sites because distance is marginal
+  group_by(Noise) %>% summarise(mn.tags = mean(n.tags,na.rm=T)) ##must not be many sites because distance is marginal
 
 task <- task %>% mutate(Noise = ifelse(obsNoise == "Heavy", "Heavy",
 ifelse(obsNoise == "Moderate", "Moderate", "Light")))
 table(task$Noise, task$year) 
 
-noise.effect <- task %>% group_by(Noise) %>% summarise(mn.tags = mean(n.tags))
 
-light.mn <- noise.effect[noise.effect$Noise == "Light", ]$mn.tags
+noise.effect <- task %>% group_by(obsNoise) %>% summarise(mn.tags = mean(n.tags,na.rm=T))
+
+light.mn <- noise.effect[noise.effect$obsNoise == "Light", ]$mn.tags
 noise.effect$ratio <- noise.effect$mn.tags/light.mn
 noise.effect$noise_rank <- light.mn/noise.effect$mn.tags
 
@@ -300,20 +312,21 @@ getmode <- function(v) {
    uniqv[which.max(tabulate(match(v, uniqv)))]
 }
 
-noise.effect$Noise<-as.character(noise.effect$Noise)
+#noise.effect$obsNoise<-as.character(noise.effect$obsNoise)
 
 ### Unk, None, and Light are all grouped together as "Light"
+
 noise.df <- visits  %>% st_drop_geometry() %>%
-  mutate(Noise = ifelse(obsNoise == "Moderate", "Moderate",
+  mutate(obsNoise = ifelse(obsNoise == "Moderate", "Moderate",
                                              ifelse(obsNoise == "Heavy", "Heavy", "Light"))) %>%
-  mutate(Noise = ifelse(is.na(Noise), "Light", Noise)) %>% 
-  left_join(noise.effect %>% select(Noise, noise_rank)) %>%
+  mutate(obsNoise = ifelse(is.na(obsNoise), "Light", obsNoise)) %>% 
+  left_join(noise.effect %>% select(obsNoise, noise_rank)) %>%
   group_by(siteID) %>% summarise(noise.tag.abun = mean(noise_rank),
-                                 noise.linear = mean(ifelse(Noise == "Light", 1, 
-                                                       ifelse(Noise == "Moderate", 2, 3))),
-                                 noise.sq = mean(ifelse(Noise == "Light", 1, 
-                                                       ifelse(Noise == "Moderate", 4, 9))),
-                                 noise.mode = as.factor(getmode(Noise))) 
+                                 noise.linear = mean(ifelse(obsNoise == "Light", 1, 
+                                                       ifelse(obsNoise == "Moderate", 2, 3))),
+                                 noise.sq = mean(ifelse(obsNoise == "Light", 1, 
+                                                       ifelse(obsNoise == "Moderate", 4, 9))),
+                                 noise.mode = as.factor(getmode(obsNoise))) 
 
 #hist(noise.df$noise.tag.abun) 
 #hist(noise.df$noise.linear) 
@@ -411,7 +424,7 @@ filter(counts, species_code == "AMRO" & siteID != "371499-B") %>%
 filter(counts, species_code == "DEJU"& siteID != "371499-B") %>% ggplot(aes(exp(offset), abundance)) + geom_point() + geom_smooth() 
 ## Abundance increases with offset (i.e. more individuals detected if higher probability of detection/more surveys)
 
-saveRDS(counts, file.path("E:/Archive",pipeline, "out", "sitelevel_counts.RDS"))
+saveRDS(counts, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "out", "sitelevel_counts.RDS"))
 ```
 
 Checked site-pooling logic with bsims - this seems like a good

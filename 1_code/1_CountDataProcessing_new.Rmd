@@ -81,14 +81,14 @@ wt_auth()
 
 my_projects <- wt_get_download_summary(sensor_id = 'ARU')
 filter(my_projects, organization %in% c("WCSC", "CWS-NOR"))
-project_ids <- c(577,2078,2782,446) ## ADD 446 back once i get access!!!
+project_ids <- c(577,2078,2782,446) 
 #THese are the project with data from our region of interest
 proj_names <- filter(my_projects, project_id %in% project_ids) %>% pull(project)
 
 aru <- map(project_ids, \(id) wt_download_report(project_id = id, sensor_id = "ARU", report = c("main"), weather_cols = F))
 
-write_rds(aru, file.path('E:/Archive/',pipeline, "tmp", "wt_2024_11_12.RDS")) ## store a backup copy of the download file so download can be skipped in future
-aru <- read_rds(file.path('E:/Archive/',pipeline, "tmp", "wt_2024_11_12.RDS"))
+#write_rds(aru, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "tmp", #"wt_2024_11_12.RDS")) ## store a backup copy of the download file so download can be skipped in future
+aru <- read_rds(file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "tmp", "wt_2024_11_12.RDS"))
 
 # aru <- map(aru, \(df) wt_tidy_species(df, remove = c("mammal", "amphibian", "abiotic", 
 #                            "insect")) %>% ## keeps only bird species
@@ -109,17 +109,27 @@ wildtrax and are read in from .csvs.
 
 ```{r}
 ##Noise data isn't included in ARU reports that can be downloaded from wildtrax. Need to manually download tasks from website (open project > manage > download tasks).
-aru_noise <- rbind(read_csv("E:/Archive/0_data/SB2023_Tasks_20240219.csv"), read_csv("E:/Archive/0_data/SB2021_Tasks_20240219.csv"), read_csv("E:/Archive/0_data/South Beringia Priority Place Cumulative Effects 2024_Tasks_202423.csv"), read_csv("E:/Archive/0_data/CWS1718_Tasks_20231207.csv"))
+aru_noise <- rbind(read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/SB2023_Tasks_20240219.csv"), read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/SB2021_Tasks_20240219.csv"), read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/SB_2024_Tasks_202438.csv"), read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/BBMP2017_2018_tasks.csv"))
 
 ## Extract noise levels and summarise into a single observed noise variable by selecting the highest noise level across 'industry' and 'other' noise types, then join with the ARU transcription data. 
 
+
+
 aru_noise <- aru_noise %>% filter(status=="Transcribed") %>%
-  mutate(recordingDate = as.character(recordingDate), 
+  mutate(recordingDate_char = as.character(recordingDate), 
          task_duration = paste0(taskLength, "s"),
          industryNoise = factor(industryNoise, c("Unk", "None","Light","Moderate","Heavy"), ordered = T),
          otherNoise = factor(otherNoise, c("Unk","None","Light","Moderate","Heavy"), ordered = T)) %>%
   rowwise %>% mutate(obsNoise = max(industryNoise, otherNoise, na.rm = T)) %>%
-  select(location, task_id = internal_task_id, recording_date_time = recordingDate, observer = transcriber, task_method = method, obsNoise) %>%mutate(recording_date_time=ymd_hms(recording_date_time))%>% ungroup()
+  select(location, task_id = internal_task_id, recording_date_time = recordingDate, observer = transcriber, task_method = method, obsNoise) %>%ungroup()
+
+# aru_noise[3143,]$recording_date_time<-ymd_hms("2017-06-27 00:00:00")
+# aru_noise[3281,]$recording_date_time<-ymd_hms("2017-06-15 00:00:00")
+# aru_noise[3279,]$recording_date_time<-ymd_hms("2017-06-06 00:00:00")
+# aru_noise[3221,]$recording_date_time<-ymd_hms("2017-06-14 00:00:00")
+
+aru_noise<-aru_noise%>%filter(!is.na(recording_date_time))
+
 
 aru <- map(aru, \(df) df %>% left_join(aru_noise))
 ```
@@ -128,17 +138,17 @@ Clean up the ARU data
 
 ```{r}
 ## one recording has wrong time stamp
-table(str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4)) 
-str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4) <- "2023"
+# table(str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4)) 
+# str_sub(aru$`South Beringia Priority Place Cumulative Effects 2023`$recording_date_time, 1, 4) <- "2023"
 
 ## seperate station number from site ID
-aru[[1]] <- aru[[1]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+aru[[1]] <- aru[[1]] %>% mutate(recording_date_time=recording_date_time,site = str_split_i(location, "-", 1), 
                       station = str_split_i(location, "-", 2))
-aru[[2]] <- aru[[2]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+aru[[2]] <- aru[[2]] %>% mutate(recording_date_time=recording_date_time,site = str_split_i(location, "-", 1), 
                       station = str_split_i(location, "-", 2))
-aru[[3]] <- aru[[3]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = str_split_i(location, "-", 1), 
+aru[[3]] <- aru[[3]] %>% mutate(recording_date_time=recording_date_time,site = str_split_i(location, "-", 1), 
                       station = str_split_i(location, "-", 2))
-aru[[4]] <- aru[[4]] %>% mutate(recording_date_time=ymd_hms(recording_date_time),site = paste(str_split_i(location, "-", 3), 
+aru[[4]] <- aru[[4]] %>% mutate(recording_date_time=recording_date_time,site = paste(str_split_i(location, "-", 3), 
                                               substring(str_split_i(location, "-", 4), 1, 1), sep = "-"),
                       station = substring(str_split_i(location, "-", 4), 2))
 
@@ -149,13 +159,12 @@ aru <- lapply(aru, function(df) {
 
 aru <- bind_rows(aru)
 
+
 aru <- aru %>% select(org = organization, locID = location_id, site, station, lat = latitude, lon =  longitude,
                       recID = recording_id, taskID = task_id, recording_date = recording_date_time, 
                       dur = task_duration, task_comments, obs = observer_id, 
                       species_code, species_common_name, tagID = tag_id, 
-                      count = individual_count, voc = vocalization, detection_time, obsNoise) %>%
-  mutate(recording_date = ymd_hms(recording_date, tz = "Canada/Yukon"), 
-         dur = as.numeric(substr(dur,1,nchar(dur)-1)))
+                      count = individual_count, voc = vocalization, detection_time, obsNoise) %>% mutate(dur = as.numeric(substr(dur,1,nchar(dur)-1)))
 
 ## remove duplicated counts (same recording, two blind transcribers)
 tmp <- aru %>% select(site, station, recording_date, taskID, obs) %>% distinct() %>% 
@@ -185,7 +194,7 @@ table(aru %>% group_by(locID, species_code) %>% summarise(n.of.ind = n()) %>% fi
 aru <- aru %>% mutate(count = as.numeric(ifelse(count == "TMTT", 5, count)))
 
 
-aru.sites <- unique(aru$siteID)
+aru.sites <- unique(aru$site)
 aru$ts <- aru$recording_date
 aru$voc <- factor(aru$voc) #call, song, non-vocal
 
@@ -239,22 +248,24 @@ sites had incorrect coordinates, which should be replaced by those in
 
 ```{r PC}
 ## Site metadata
-sites2021 <- read_csv("E:/Archive/0_data/EW2021-Sites-correctedmjb.csv")
-names(sites2021) <- c("siteID", "station", "method", "date", "time", "survey_type", "UTM_zone", "easting", "northing", "coord_cor", "observer",
-                      "ARU_id", "SD_A", "SD_B", "loc_move", "prefix_correct", "pickup_date", "pickup_time", "temp", "wind", "precip",
-                      "cloud", "comments")
-sites2021$time <- dmy_hms(paste(sites2021$date, hour(sites2021$time),
-                                minute(sites2021$time), second(sites2021$time)),
-                          tz = "Canada/Yukon")
-sites2021$pickup_time <- dmy_hms(paste(sites2021$pickup_date, sites2021$pickup_time),
-                                   tz = "Canada/Yukon")
-
+#WE ARE NOT USING 2021 PC
+# sites2021 <- read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/EW2021-Sites-correctedmjb.csv")
+# names(sites2021) <- c("siteID", "station", "method", "date", "time", "survey_type", "UTM_zone", "easting", "northing", "coord_cor", "observer",
+#                       "ARU_id", "SD_A", "SD_B", "loc_move", "prefix_correct", "pickup_date", "pickup_time", "temp", "wind", "precip",
+#                       "cloud", "comments")
+# sites2021$time <- dmy_hms(paste(sites2021$date, hour(sites2021$time),
+#                                 minute(sites2021$time), second(sites2021$time)),
+#                           tz = "Canada/Yukon")
+#sites2021$pickup_time <- as.POSIXct(paste(sites2021$pickup_date, #sites2021$pickup_time),
+#                                   format = "%Y-%m-%d %H:%M")
+#sites2021$time<-as.POSIXct(paste(sites2021$date, sites2021$time), format = "%Y-%m-%d %H:%M")
+#sites2021<-sites2021%>%filter(method=="PC")
 
 ###ECCC data PC data ----
-eccc <- read_csv("E:/Archive/0_data/CWS_WH_LANDBIRD_PCS_2017-2019.csv")
+eccc <- read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/CWS_WH_LANDBIRD_PCS_2017-2019.csv")
 ###some coordinates were incorrect in the database when provided. 
 ##correct coordinates
-coord.cor <- read_csv("E:/Archive/0_data/CWS_CoordCor.csv") ##provided by logan (feb 2023)
+coord.cor <- read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/CWS_CoordCor.csv") ##provided by logan (feb 2023)
 coord.cor <- select(coord.cor, loc_name, lat, lon) %>% distinct()
 
 eccc <-left_join(eccc, coord.cor)
@@ -313,28 +324,42 @@ also potentially be added here. SiteID and station links it to the sites
 dataframe.
 
 ```{r visits}
+aru$dur[aru$dur == 6] <- 60
+aru$dur[aru$dur == 18] <- 180
+aru$dur[aru$dur == 30] <- 300
 visits <- aru %>% select(siteID, station, ts , dur, obsNoise, observer) %>% distinct() %>% 
   mutate(dur_min = dur/60,  method = "ARU", observer = as.character(observer))
+visits$dur_min[visits$dur_min == 0.3] <- 3
+visits$dur_min[visits$dur_min == 0.1] <- 1
+
+
 
 ##obsID: 527 = CWS, 918 = avery,  2643 = chris, 1136 = Pat
 
-sites2021 <- left_join(sites2021, aru %>% select(siteID, station, time = ts, obsNoise)) ### all 2021 PCs have obsNoise from ARUs (all paired. )
+#sites2021 <- left_join(sites2021, aru %>% select(siteID, station, time = ts, #obsNoise)) ### all 2021 PCs have obsNoise from ARUs (all paired. )
 
-visits <- rbind(visits,
-                sites2021 %>% filter(method == "PC") %>% 
-                  select(siteID, station, ts = time, obsNoise, observer) %>%
-                  distinct() %>%
-                  mutate(method = "PC", dur_min = 10, dur = 600) 
-                %>% select(names(visits)))
+# visits <- rbind(visits,
+#                 sites2021 %>% filter(method == "PC") %>%
+#                   select(siteID, station, ts = time, obsNoise, observer) %>%
+#                   distinct() %>%
+#                   mutate(method = "PC", dur_min = 10, dur = 600)
+#                 %>% select(names(visits)))
+
+visits<-visits%>%filter(!is.na(ts))
+
 eccc <- left_join(eccc, data.frame(noise = 0:3, obsNoise = factor(c("None","Light","Moderate","Heavy"), 
                                                                   levels = c("Unk", "None","Light","Moderate","Heavy"), 
                                                                   ordered = T)))
 eccc[is.na(eccc$noise),]$obsNoise <- "Unk" ## assume counts without noise ranking have none/light noise as per PC protocols
 
 eccc <- eccc %>%  
-  mutate(ts = ymd_hm(paste(year, month, day, hour_start, minute_start),  
-                     tz = "Canada/Yukon"),
-         method = "PC", dur_min = 10, dur = 600) %>% rename(observer = observer_num)
+  mutate(ts=paste0(year,"-", month,"-", day," ", hour_start,":", minute_start), method = "PC", dur_min = 10, dur = 600) %>% rename(observer = observer_num)
+
+eccc<-eccc%>%mutate(ts=ymd_hm(ts))
+#23 have bad time
+eccc<-eccc%>%filter(!is.na(ts))
+
+
 visits <- rbind(visits, eccc %>% #filter(!is.na(ts)) %>% 
                   select(names(visits)) %>% distinct())
 
@@ -347,17 +372,19 @@ visits %>% filter(siteID == 'SB108') %>% arrange(station, ts) ##paired ARU PC ti
 visits[visits$siteID == 'SB108' & visits$station == 6 & is.na(visits$ts), "ts"] <- visits[visits$siteID == 'SB108' & visits$station == 6 & !is.na(visits$ts), "ts"] #paired, so we know the time
 visits$year <- year(visits$ts)
 
-##missing time stamps
-visits[visits$siteID == "364872-D" & is.na(visits$ts), "year"] <- 2017
-visits[visits$siteID == "361264-D" & is.na(visits$ts), "year"] <- 2017
-visits[visits$siteID == "371138-B" & is.na(visits$ts), "year"] <- 2017
-visits[visits$siteID == "333099-D" & is.na(visits$ts), "year"] <- 2017
+# ##missing time stamps
+# visits[visits$siteID == "364872-D" & is.na(visits$ts), "year"] <- 2017
+# visits[visits$siteID == "361264-D" & is.na(visits$ts), "year"] <- 2017
+# visits[visits$siteID == "371138-B" & is.na(visits$ts), "year"] <- 2017
+# visits[visits$siteID == "333099-D" & is.na(visits$ts), "year"] <- 2017
 
 sites <- left_join(sites, visits %>% select(siteID, year)%>%distinct())
-sites[sites$siteID == "SB010" & is.na(sites$year), "year"] <- 2021
+#sites[sites$siteID == "SB010" & is.na(sites$year), "year"] <- 2021
 
 visits <- left_join(visits, as.data.frame(sites) %>% select(siteID, organization, station) %>% distinct())
 
+#visits<-visits%>%filter(!is.na(visits$ts))
+#visits$obsNoise[is.na(visits$obsNoise)]<-"Unk"
 ```
 
 ## Counts dataframe
@@ -377,18 +404,18 @@ tmp <- eccc %>% select(siteID, station, ts, species_code = species_id, tag_min=t
 
 counts <- rbind(counts, tmp %>% arrange(ts, tag_min) %>%  group_by(siteID, station, ts, species_code) %>% mutate(individual = row_number()) %>% select(names(counts)))
 
-###WCS point counts
-wcs.det <- read.csv("E:/Archive/0_data/EW2021-JUL-21_Detections.csv")
-names(wcs.det) <- c("siteID", "station", "species_code", "breeding_code", "age", "sex", "abundance", "tag_min", "distance_interval", "detection_type", "direction", "comments")
-
-table(wcs.det$tag_min)
-wcs.det$tag_min <- ifelse(wcs.det$tag_min %in% c("AFTER", "BEFORE"), Inf, ifelse(wcs.det == "", NA, as.numeric(wcs.det$tag_min)))
-
-wcs.det <- visits %>% filter(method == "PC") %>% select(siteID, station, ts, method) %>% 
-  right_join(wcs.det) %>% arrange(ts, tag_min) %>%  
-  group_by(siteID, station, ts, species_code) %>% mutate(individual = row_number()) %>% 
-  mutate(scientific_name = NA, species_english_name = NA)
-counts <- rbind(counts, wcs.det %>% select(names(counts)))
+# ###WCS point counts
+# #wcs.det <- read.csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/EW2021-JUL-21_Detections.csv")
+# #names(wcs.det) <- c("siteID", "station", "species_code", "breeding_code", "age", "sex", "abundance", "tag_min", "distance_interval", "detection_type", "direction", "comments")
+# 
+# table(wcs.det$tag_min)
+# wcs.det$tag_min <- ifelse(wcs.det$tag_min %in% c("AFTER", "BEFORE"), Inf, ifelse(wcs.det == "", NA, as.numeric(wcs.det$tag_min)))
+# 
+# wcs.det <- visits %>% filter(method == "PC") %>% select(siteID, station, ts, method) %>% 
+#   right_join(wcs.det) %>% arrange(ts, tag_min) %>%  
+#   group_by(siteID, station, ts, species_code) %>% mutate(individual = row_number()) %>% 
+#   mutate(scientific_name = NA, species_english_name = NA)
+# counts <- rbind(counts, wcs.det %>% select(names(counts)))
 
 ## remove sites not in sites list
 counts <- semi_join(counts, sites)
@@ -520,7 +547,7 @@ try(counts[counts$species_code == "UNK 'SEEP!'",]$species_code <- "UNKN")
 
 
 ## add scientific and english names to detections with just species_code
-alphaCodes <- read_csv("E:/Archive/0_data/species_codes.csv")
+alphaCodes <- read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/species_codes.csv")
 
 counts <- counts %>% left_join(alphaCodes %>% select(species_code = SPEC, scientific_name = SCINAME, COMMONNAME)) %>%
   mutate(species_english_name = ifelse(is.na(species_english_name), COMMONNAME, species_english_name)) %>% 
@@ -549,7 +576,7 @@ checklist of North and Middle American Birds (downloaded Feb 2022).\
 <http://checklist.americanornithology.org/taxa>
 
 ```{r}
-taxon <- read_csv("E:/Archive/0_data/NACC_list_species.csv")
+taxon <- read_csv("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/NACC_list_species.csv")
 
 #seperate scientific_name into genus and species
 counts$genus <- str_split_fixed(counts$scientific_name,  " ", 2)[,1]
@@ -792,6 +819,9 @@ index, n.stations, total recording time.
 
 ```{r counts sum1}
 #N. stations per site
+visits<-visits%>%filter(!is.na(ts))
+visits$dur_min <- unlist(visits$dur_min)#what the heck?!?
+
 counts_sum <- visits %>% select(siteID, station, year, method, dur_min) %>% distinct() %>% 
   group_by(siteID, year, method) %>% 
   summarise(n.stations = n(), mn.count.dur = mean(dur_min)) ##several stations with just 1 recording? don't have full hex code
@@ -934,6 +964,17 @@ species.abundance.l <- lapply(counts.l, function(site){
   
 })
 
+# Create a new list `trash` containing only the items from `species.abundance.l` whose names end with "NA"
+trash <- species.abundance.l[grepl("NA$", names(species.abundance.l))]
+species.abundance.l <- species.abundance.l[!grepl("NA$", names(species.abundance.l))]
+
+a<-data.frame(sal.station=names(species.abundance.l))
+b<-data.frame(counts.station=paste0(counts_sum$siteID,' ',counts_sum$method))
+c<-setdiff(a$sal.station, b$counts.station)
+#gets stuck here if species.abundance.l and counts_sum are not same length
+counts_sum<-counts_sum%>%filter(!duplicated(paste0(siteID,method)))
+counts_sum<-counts_sum%>%filter(!is.na(method))
+
 counts_sum$n.LEYE <- sapply(species.abundance.l, function(site) {
   x <- site[site$species_code == "LEYE",]$abundance
   ifelse(length(x)==0, 0, x)
@@ -969,10 +1010,15 @@ counts_sum$n.SEOW <- sapply(species.abundance.l, function(site) {
   ifelse(length(x)==0, 0, x)
   })
 
+
+#species.abundance.l$`364872-D PC`$organization="ECCC"
+
 ##diversity index
 ##not accounting for n.station.
 counts_sum$div.shan.all <- sapply(species.abundance.l, function(site) shannon.index(site$abundance))
 counts_sum$div.shan <- sapply(species.abundance.l, function(site) shannon.index(site %>% filter(!(species_code %in% species.HR$species_code))%>% pull(abundance)))
+
+counts_sum<-counts_sum%>%filter(!is.na(organization))
 
 ```
 
@@ -1019,7 +1065,7 @@ dim(data.table::rbindlist(species.abundance.l) %>% group_by(species_code) %>% su
 ##50 species detected at more than 15 sites
 dim(data.table::rbindlist(species.abundance.l) %>% group_by(species_code) %>% summarise(n.sites = n()) %>% filter(n.sites>50) %>% arrange(desc(n.sites)))
 ##29 species detected at more than 50 sites
-saveRDS(species.abundance.l,  file.path(pipeline, "out", "spec_abun.RDS"))
+saveRDS(species.abundance.l,  file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "spec_abun.RDS"))
 
 ```
 
@@ -1027,24 +1073,24 @@ saveRDS(species.abundance.l,  file.path(pipeline, "out", "spec_abun.RDS"))
 
 ```{r}
 
-st_write(sites, file.path(pipeline, "out", "sites.shp"), delete_layer=T)
-saveRDS(sites, file.path(pipeline, "out", "sites.RDS"))
+st_write(sites, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "sites.shp"), delete_layer=T)
+saveRDS(sites, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "sites.RDS"))
 visits <- filter(visits, !(organization == "WCS" & method == "PC"))
-write_csv(visits, file.path(pipeline, "out", "visits.csv"))
-saveRDS(visits, file.path(pipeline, "out", "visits.RDS"))
+write_csv(visits, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "visits.csv"))
+saveRDS(visits, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "visits.RDS"))
 
-write_csv(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path(pipeline, "out", "counts.csv"))
-saveRDS(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path(pipeline, "out", "counts.RDS"))
+write_csv(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "counts.csv"))
+saveRDS(counts %>% mutate(largeHR = ifelse(species_code %in% species.HR$species_code, T, F)), file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "counts.RDS"))
 
-write_csv(counts_sum, file.path(pipeline, "out", "counts_sum.csv"))
-saveRDS(counts_sum, file.path(pipeline, "out", "counts_sum.RDS"))
+write_csv(counts_sum, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "counts_sum.csv"))
+saveRDS(counts_sum, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "out", "counts_sum.RDS"))
 
 #Mayo sites
-sites %>% st_crop(xmin = 296800, ymin = 984000, xmax = 391600, ymax = 1106450) %>% st_write(dsn = "2_pipeline/1_CountDataProcessing/tmp/sitesMayo.shp", delete_layer=T)
+sites %>% st_crop(xmin = 296800, ymin = 984000, xmax = 391600, ymax = 1106450) %>% st_write(dsn = "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/tmp/sitesMayo.shp", delete_layer=T)
 
 ## 2023 site coordinates
 tmp <- counts %>% mutate(year = year(ts)) %>% filter(year == 2023) 
 tmp <- tmp %>% group_by(siteID, station, ts, species_code, species_english_name, order, family, unk, sar) %>% summarise(abundance = sum(abundance))
-write_csv(tmp, file.path(pipeline, "tmp", "counts2023.csv"))
+write_csv(tmp, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "tmp", "counts2023.csv"))
 
 ```

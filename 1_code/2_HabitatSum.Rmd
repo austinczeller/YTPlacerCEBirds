@@ -24,9 +24,9 @@ knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning = FALSE)
 NAME <- '2_HabitatSum' ## Name of the R file goes here (without the file extension!)
 PROJECT <- 'Archive' ## Project folder
 # PROJECT_DIR <- 'C:/Users/jbrown1/surfdrive/WCSC' ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes (i.e. 
-PROJECT_DIR <- "E:/Archive"
+PROJECT_DIR <- "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds"
 
-gis_dir <- "E:/Archive/0_data/GIS"
+gis_dir <- "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/GIS"
 ##Set working directory
 # setwd(file.path(PROJECT_DIR, PROJECT))
 # knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
@@ -82,10 +82,9 @@ Load station/site coordinates
 crs = "EPSG:3579" # "NAD83 / Yukon Albers"
 
 ## Load sites files compiled from both ARU and PC data, from ECCC and WCS
-sites <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/sites.RDS") ##actually stations...
+sites <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/out/sites.RDS") ##actually stations...
 
-sites <- sites %>% select(org = organization, siteID, 
-                          station, year) %>% mutate(stationID = paste(siteID, station, sep = "-"))
+sites <- sites%>% mutate(stationID = paste(siteID, station, sep = "-"))
 ```
 
 #Preliminary site selection \## Identify sites without disturbance
@@ -112,17 +111,17 @@ linear summaries.
 ```{r missing disturbace}
 
 ## buffers used to clip disturbance areas by Pat
-d.buff2021 <- st_read("E:/Archive/0_data/sites2021_center.shp")
-d.buffHist <- st_read("E:/Archive/0_data/historical_sites_centre.shp")
+d.buff2021 <- st_read("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/sites2021_center.shp")
+d.buffHist <- st_read("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/historical_sites_centre.shp")
 d.siteH <- d.buffHist$loc_name
 d.siteH <- substr(d.siteH, 1, nchar(d.siteH)-1)
 d.site <- c(d.buff2021$Id, d.siteH)
 
 ## Sites not covered in May 2022 YG update
-YG_extent <- st_read(file.path(gis_dir, "YG_SurfaceDisturbance_May2022/Surface_Disturbance_Mapping_Extent.shp"))
-YG_extent <- filter(YG_extent, PROJ_YEAR > 2016) %>% st_union()## 2017 is start year of surveys, so use updates from that year onwards
+YG_extent <- st_read(file.path(gis_dir, "YG_SurfaceDisturbance_May2022/YG_SurfaceDisturbace_Extent_May2022.shp"))
+YG_extent <- filter(YG_extent, YEAR_SUBMI > 2016) %>% st_union()## 2017 is start year of surveys, so use updates from that year onwards
 sites <- sites %>%
-  mutate(org = str_replace(org, "WCSC", "WCS"))
+  mutate(org = str_replace(organization, "WCSC", "WCS"))
 ggplot(data = sites) + geom_sf(data = YG_extent, alpha = .5) + geom_sf(aes(col = org)) +
   ylim(800000, 1206089) + xlim(59945.54, 456776.7)  + 
   coord_sf(datum = NULL) 
@@ -133,6 +132,7 @@ sites$YG_update <- st_intersects(st_transform(sites, crs = st_crs(YG_extent)), Y
 ## 52 sites are missing buffers. 
 sites <- sites %>% mutate(dbuff = siteID %in% d.site| year == 2023)
 
+sites<-sites%>%filter(!is.na(year))
 
 ggplot(sites, aes(col = dbuff | YG_update)) + geom_sf()
 
@@ -281,7 +281,8 @@ marshes (\<0.1%). Open water, shallow and deep, constituted 1.1% of the
 project area.
 
 ```{r wetlands}
-DUC_wet <- rast(file.path(gis_dir, "/DUCWetlandInv/Duc Dawson Wetland Inventory_Phase_02/DUC_Dawson_Phase_02_Classification/DUC_DawsonP2L2.tif")) ##raster extracted from .gbd using ArcGIS without any further alterations. 
+DUC_wet <- rast(file.path(gis_dir, "DUCWetlandInv/Duc Dawson Wetland Inventory_Phase_02/DUC_Dawson_Phase_02_Classification/DUC_DawsonP2L2.tif")) ##raster extracted from .gbd using ArcGIS without any further alterations. 
+
 
 ##clip within a 1500m buffer around each station and convert to sf polygon ----
 tictoc::tic()
@@ -313,7 +314,7 @@ This was shared to me by Nadelle Flynn, before any validation had been
 done, so I'm not sure of the predictive accuracy.
 
 ```{r mayo wetland}
-# Mayo_wet <- rast(file.path(gis_dir, "MayoWetlandClassification/MayoMcQuesten_L2Wetlands_Mar2022.tif"))
+#Mayo_wet <- rast(file.path(gis_dir, "MayoWetlandClassification/MayoMcQuesten_L2Wetlands_Mar2022.tif"))
 Mayo_wet <- read_sf(file.path(gis_dir, "MayoWetlandClassification/MayoMcQuesten_L2Wetlands_Mar2022.shp")) 
 
 ##clip and convert to polygon ----
@@ -559,7 +560,7 @@ landc.ls <- landc.ls %>% bind_rows() %>%
   group_by(class) %>% summarise()  ## reduces each category to a multipolygon. This make computation faster. 
 
 try(rm(nasa_above))
-
+print("done")
 ```
 
 # Fire polygons
@@ -832,28 +833,28 @@ the disturbance polygons to create separate disturbance classes.
 
 ```{r}
 
-files <- list.files("E:/Archive/0_data/GEE", pattern = "B3B8")
+files <- list.files("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/GEE", pattern = "B3B8")
 files <- files[!str_detect(files, "tif.")]
 watermask <- pmap(list(p.dist.yr, c("2017", "2018", "2021","2023","2024")),
                                 function(p.dist, yr){
   file <- files[str_which(files, yr)]
-  r <- rast(file.path("E:/Archive/0_data/GEE", file))
+  r <- rast(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/GEE", file))
   crs.r <- terra::crs(r)
   r = crop(x = r, y = p.dist %>% st_transform(crs = crs.r), mask=T, touches = F)
   r <- r > 0.046
   r
     })
-write_rds(watermask, file.path("E:/Archive",pipeline, "store", "watermask_dclip_rast.rds"))
+write_rds(watermask, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "watermask_dclip_rast.rds"))
 
-files <- list.files("E:/Archive/0_data/GEE/", pattern = "ndvi")
+files <- list.files("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/GEE/", pattern = "ndvi")
 files <- files[!str_detect(files, "tif.")] ## removes potential tif.aux files, e.g. if ArcGIS is open
 vegmask <- pmap(list(p.dist.yr, c("2017", "2018","2021","2023","2024")), function(p.dist, yr){
   file <- files[str_which(files, yr)]
-  r <- rast(file.path("E:/Archive/0_data/GEE/", file))
+  r <- rast(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/GEE/", file))
   r = crop(x = r, y = p.dist %>% st_transform(crs = terra::crs(r)), mask=T, touches = F)
   r > 0.42
 })
-write_rds(vegmask, file.path("E:/Archive",pipeline, "store", "vegmask_dclip_rast.rds"))
+write_rds(vegmask, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "vegmask_dclip_rast.rds"))
 
 ## for communityAnalysis.R
 # veg23 <- rast("0_data/GEE/ndvi_2023.tif")
@@ -883,7 +884,7 @@ p.dist <- pmap(list(vegmask, watermask), function(v, w){
   v <- as.numeric(v)
   mask(x = v, mask = w, maskvalues = TRUE, updatevalue = 3)
 })  ## 1 = veg, 0 = bare, 3 = water
-write_rds(p.dist, file.path("E:/Archive",pipeline, "store", "p.dist_rast.rds"))
+write_rds(p.dist, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "p.dist_rast.rds"))
 
 type.df <- data.frame(typeID = c(1, 0, 3), type = c("d_pVeg", "d_pBare", "d_pWater"))
 p.dist <- map(p.dist, function(r){
@@ -891,7 +892,7 @@ p.dist <- map(p.dist, function(r){
   names(p) = "typeID"
   p = st_as_sf(p) %>% left_join(type.df)
 })
-write_rds(p.dist, file.path("E:/Archive/",pipeline, "store", "p.dist_p.rds"))
+write_rds(p.dist, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/",pipeline, "store", "p.dist_p.rds"))
 
 
 rm(vegmask, watermask)
@@ -902,7 +903,7 @@ sites.yr <- sites %>% st_buffer(1500) %>%
   st_transform(crs = crs <- "EPSG:3579")%>%
   split(.$year) 
 
-saveRDS(sites.yr, file.path("E:/Archive",pipeline, "store", "sites_yr.RDS"))
+saveRDS(sites.yr, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "sites_yr.RDS"))
 
 # p.dist.sites <- pmap(list(sites.yr , p.dist), function(site, dist){
 #     st_intersection(site, dist %>% st_transform(crs = st_crs(landc.ls)))
@@ -951,17 +952,17 @@ approach taken with the habitat layers). Water captured by the watermask
 ```{r hab poly}
 
 ##save originals before editing
-saveRDS(wetland, file.path("E:/Archive",pipeline, "store", "wetlandPoly.RDS")) #polygon
-saveRDS(fire, file.path("E:/Archive",pipeline, "store", "firePoly.RDS")) #polygon
-saveRDS(landc.ls, file.path("E:/Archive",pipeline, "store", "landcPoly.RDS")) ## raster, cropped to site buffer
-saveRDS(sites, file.path("E:/Archive",pipeline, "store", "sites_habpoly.RDS"))
+saveRDS(wetland, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "wetlandPoly.RDS")) #polygon
+saveRDS(fire, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "firePoly.RDS")) #polygon
+saveRDS(landc.ls, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "landcPoly.RDS")) ## raster, cropped to site buffer
+saveRDS(sites, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "sites_habpoly.RDS"))
 
-p.dist <- read_rds(file.path("E:/Archive",pipeline, "store", "p.dist_p.rds"))
-wetland <- readRDS(file.path("E:/Archive",pipeline, "store", "wetlandPoly.RDS"))
-fire <- readRDS(file.path("E:/Archive",pipeline, "store", "firePoly.RDS"))
-landc.ls<- readRDS(file.path("E:/Archive",pipeline, "store", "landcPoly.RDS"))
-sites <- readRDS(file.path("E:/Archive",pipeline, "store", "sites_habpoly.RDS"))
-sites.yr <- readRDS(file.path("E:/Archive",pipeline, "store", "sites_yr.RDS"))
+p.dist <- read_rds(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "p.dist_p.rds"))
+wetland <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "wetlandPoly.RDS"))
+fire <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "firePoly.RDS"))
+landc.ls<- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "landcPoly.RDS"))
+sites <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "sites_habpoly.RDS"))
+sites.yr <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "sites_yr.RDS"))
 
 crs <- "EPSG:3579" ## use projected crs for intersections
 
@@ -1146,10 +1147,10 @@ wetland.station <- pmap(list(wetland,
 wetland.station <- wetland.station %>% mutate(class2 = ifelse(str_starts(class,"H_"), "h_wet", "d_wet"))
 # ggplot(hab.poly.station %>% filter(stationID == "MR15-2")) + geom_sf(aes(fill = class)) + geom_sf(data = wetland.station%>% filter(stationID == "MR15-2"), alpha = .5, aes(colour = class2))
 
-saveRDS(hab.poly.station, file.path("E:/Archive",pipeline, "store", "lcmerge_stat.RDS"))
-saveRDS(hab.poly.site, file.path("E:/Archive",pipeline, "store", "lcmerge.RDS"))
-saveRDS(wetland.site, file.path("E:/Archive",pipeline, "store", "wetland_site.RDS"))
-saveRDS(wetland.station, file.path("E:/Archive",pipeline, "store", "wetland_station.RDS"))
+saveRDS(hab.poly.station, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "lcmerge_stat.RDS"))
+saveRDS(hab.poly.site, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "lcmerge.RDS"))
+saveRDS(wetland.site, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "wetland_site.RDS"))
+saveRDS(wetland.station, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "wetland_station.RDS"))
 
 rm(fire, landc.ls, wetland, p.dist, p.dist.yr, p.dist.23, d.buff2021, d.buffHist)
 
@@ -1629,7 +1630,7 @@ ggplot(hab.poly.l$`MS12-2`, aes(fill = class)) + geom_sf(alpha = .5)
 hab.poly.station <- bind_rows(bind_rows(hab.poly.l), 
                  hab.poly.station %>% filter(!stationID %in% names(hab.poly.l)))
 
-saveRDS(hab.poly.station, file.path("E:/Archive",pipeline, "store", "lcmerge_stat_linear.RDS"))
+saveRDS(hab.poly.station, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "lcmerge_stat_linear.RDS"))
 ```
 
 # Waterways
@@ -1655,29 +1656,33 @@ to assign stream order based on the Strahler method.
 ## canvec waterways ----
 
 fgdb <- file.path(gis_dir, "canvec_50k_YT_Hydro.gdb")
-waterway <- st_as_sf(vect(fgdb, layer="water_linear_flow_1"))
-bbox <- st_bbox(c(xmin = -141.0,
-                  ymin = 63.0,    
-                  xmax = -135.5,  
-                  ymax = 65),crs=st_crs(waterway))
+# waterway <- st_as_sf(vect(fgdb, layer="water_linear_flow_1"))
+# bbox <- st_bbox(c(xmin = -141.0,
+#                   ymin = 63.0,    
+#                   xmax = -135.5,  
+#                   ymax = 65),crs=st_crs(waterway))
+# 
+# bbox_sf <- st_as_sfc(bbox)
+# 
+# tictoc::tic()
+# waterway <- st_intersection(waterway, bbox_sf)
+# tictoc::toc()
+# ## clips to just lines around sites, but no attribute info
+# tictoc::tic()
+# waterway <- st_intersection(sites %>% st_buffer(1500) %>% 
+#                                st_union() %>% 
+#                                st_transform(crs = st_crs(waterway)),
+#                              waterway)
+# tictoc::toc()
+# ## add site and station IDs so we can filter 
+# waterway <- st_intersection(st_as_sf(waterway), 
+#                              sites %>% st_buffer(1500) %>% 
+#                                group_by(siteID, stationID) %>% summarise() %>% 
+#                               st_transform(crs = st_crs(waterway)))
 
-bbox_sf <- st_as_sfc(bbox)
-
-tictoc::tic()
-waterway <- st_intersection(waterway, bbox_sf)
-tictoc::toc()
-## clips to just lines around sites, but no attribute info
-tictoc::tic()
-waterway <- st_intersection(sites %>% st_buffer(1500) %>% 
-                               st_union() %>% 
-                               st_transform(crs = st_crs(waterway)),
-                             waterway)
-tictoc::toc()
-## add site and station IDs so we can filter 
-waterway <- st_intersection(st_as_sf(waterway), 
-                             sites %>% st_buffer(1500) %>% 
-                               group_by(siteID, stationID) %>% summarise() %>% 
-                              st_transform(crs = st_crs(waterway)))
+#INSTEAD OF RERUNNING ABOVE I JUST DID THE BELOW
+#add waterway to this from old run
+waterway<-readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/waterway.rds")
 
 ##Stream order ----
 
@@ -1706,9 +1711,12 @@ be a better option, but the scale is too coarse and I don't trust myself
 to properly krig/resample to reduce the resolution in a montaine area.
 
 ```{r}
-daymet <- readRDS("0_data/daymet_5yr.rds") ## 5 year average from june (or last snow in the year)
+# daymet <- readRDS(" 0_data/daymet_5yr.rds") ## 5 year average from june (or last snow in the year)
+# 
+# daymet <- select(daymet, siteID, year, starts_with("mn_"))
 
-daymet <- select(daymet, siteID, year, starts_with("mn_"))
+daymet<-readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/0_data/final_weather_summary.RDS")
+
 
 ```
 
@@ -1721,9 +1729,9 @@ disturbance types combined. )
 ```{r hab sum - nasa 1}
 
 ## Decide whether we are using the habitat data with or without polygonized linear features. 
-hab.poly.station <- readRDS(file.path("E:/Archive",pipeline, "store", "lcmerge_stat.RDS")) ## without linear polygons
+hab.poly.station <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "lcmerge_stat.RDS")) ## without linear polygons
 # hab.poly.station <- readRDS(file.path(pipeline, "store", "lcmerge_stat_linear.RDS")) ## with linear polygons
-wetland.station <- readRDS(file.path("E:/Archive",pipeline, "store", "wetland_station.RDS")) 
+wetland.station <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "wetland_station.RDS")) 
 
 ## site ID variables
 site.sum <- sites %>% st_drop_geometry() %>% 
@@ -1746,7 +1754,7 @@ sites.l <- split(sites, f = sites$stationID)[names(hab.poly.site.l)]
 all.equal(names(sites.l), names(hab.poly.site.l))
 
   
-buff.v <- c(150, 250, 500, 750, 1000)  ## can't go beyon 1000m because 2021 data digitization stoped at 1.5k from site centroid (~1k from the corner sites)
+buff.v <- c(150, 500, 1000)  ## can't go beyon 1000m because 2021 data digitization stoped at 1.5k from site centroid (~1k from the corner sites)
 # buff.v <- c(150, 1000)  ## smallest test
 
 ##creates a list where each element is a different buffer 
@@ -1822,10 +1830,11 @@ hab.sum <- left_join(hab.sum, list_rbind(hab.buff))
 
 ### add elevation ----
 hab.sum <- left_join(hab.sum, elev_mn %>% rename(elev = mean))
- hab.sum <- left_join(hab.sum, bz_sum %>% select(siteID, hc_borealLow = P.Boreal_Low, hc_borealSubalpine = P.Boreal_Subalpine))
+hab.sum <- left_join(hab.sum, bz_sum %>% select(siteID, hc_borealLow = P.Boreal_Low, hc_borealSubalpine = P.Boreal_Subalpine))
+print("done")
 
 ##add daymet weather
-hab.sum <- left_join(hab.sum, daymet) 
+hab.sum <- left_join(hab.sum, daymet%>%select(!year),by="siteID") 
 
 ```
 
@@ -1896,26 +1905,40 @@ table(hab.sum.lf$buffer) ## missing rows if there are no linear features that ov
 
 
 ## waterways ----
-waterway.l <- waterway %>% split(.$stationID) 
+## waterways ----
+waterway.l <- waterway %>% split(.$stationID)
 sites.l <- split(sites, f = sites$stationID)[names(waterway.l)]
+
+valid_indices <- which(!sapply(sites.l, is.null) & !sapply(waterway.l, is.null))
+sites.l <- sites.l[valid_indices]
+waterway.l <- waterway.l[valid_indices]
 
 water.den <- map(buff.v, function(buff) {
 
   waterway.buff.i <- pmap(list(sites.l, waterway.l),
-                            function(site, poly){
-                              site <- st_buffer(site, dist = buff) %>%
-                                st_union() %>% st_transform(crs = st_crs(poly))
-                              st_intersection(poly, site)
-                            }) 
+                          function(site, poly) {
+                            if (is.null(site) || is.null(poly)) return(NULL)
+                            site <- st_buffer(site, dist = buff) %>%
+                              st_union() %>%
+                              st_transform(crs = st_crs(poly))
+                            st_intersection(poly, site)
+                          })
+  
+  # Remove NULL results from `pmap`
+  waterway.buff.i <- waterway.buff.i[!sapply(waterway.buff.i, is.null)]
+  
   waterway.buff.i <- bind_rows(waterway.buff.i)
   waterway.buff.i$length <- waterway.buff.i %>% st_length()
+  
   st_drop_geometry(waterway.buff.i) %>% 
     group_by(siteID, stationID) %>%
-    summarise(length = sum(length)) %>% 
+    summarise(length = sum(length)) %>%
     left_join(filter(hab.sum, buffer == buff) %>% select(siteID, stationID, buffer, site.area)) %>%
-    mutate(wden = as.numeric(length/site.area)) %>% select(siteID, stationID, buffer, wden) %>% 
-    mutate(buffer = buff) 
+    mutate(wden = as.numeric(length/site.area)) %>%
+    select(siteID, stationID, buffer, wden) %>%
+    mutate(buffer = buff)
 })
+
 
 water.den <- list_rbind(water.den)
 
@@ -1977,11 +2000,12 @@ table(hab.sum$buffer, is.na(hab.sum$wden_5))
 
 ```{r habsum tidy}
 names(hab.sum)
+hab.sum<-hab.sum%>%distinct()
 hab.sum$site.area <- as.numeric(hab.sum$site.area)
 hab.sum <- hab.sum %>% rename_with(\(x) str_replace(x, pattern = "H_", replacement = "h_"), starts_with('H_'))
 hab.sum$wden_high <- rowSums(hab.sum %>% select(wden_6, wden_7, wden_8))
 hab.sum <- hab.sum %>% select(-wden_6, -wden_7, -wden_8, - site.area) ## low rep of high order streams, so group into a single class
-
+names(hab.sum)
 ##Fill sites without a given hab class with 0
 hab.sum[, !(names(hab.sum) %in% c("elev",  "mn_temp", "total_precip", "last_snow", "buffer", "site.area"))][is.na(hab.sum[, !(names(hab.sum) %in% c("elev",  "mn_temp", "total_precip", "last_snow", "buffer", "site.area"))])] <- 0
 ##these columns NAs represent missing data, not zero coverage
@@ -1991,14 +2015,14 @@ hab.sum[, !(names(hab.sum) %in% c("elev",  "mn_temp", "total_precip", "last_snow
 ### save
 
 ```{r}
-saveRDS(hab.sum, file.path("E:/Archive",pipeline, "out", "hab_sum.RDS")) ## station level habitat summary
+saveRDS(hab.sum, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "out", "hab_sum.RDS")) ## station level habitat summary
 
 ###site-level ----
 # average across stations proportional to the number of visits at that station. 
 # Should be reflective of relative effort for most sites, sites mixing ARU and PC perhaps not (over emphasis on ARU stations vs PC stations)
 
-hab.sum <- read_rds("E:/Archive/2_pipeline/2_HabitatSum/out/hab_sum.RDS")
-visits <- readRDS("E:/Archive/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
+hab.sum <- read_rds("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/2_HabitatSum/out/hab_sum.RDS")
+visits <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/1_CountDataProcessing/out/visits.RDS") ## time variant survey parameters
 
 visits$stationID <- paste(visits$siteID, visits$station, sep = "-")
 
@@ -2027,7 +2051,7 @@ sitesC$lat_wgs84 <- st_coordinates(st_transform(sitesC, crs = "EPSG:4326"))[,2]
 hab.sum <- left_join(hab.sum, st_drop_geometry(sitesC))
 hab.sum2 <- left_join(hab.sum2, st_drop_geometry(sitesC))
 
-saveRDS(hab.sum, file.path("E:/Archive",pipeline, "out", "hab_sum_site.RDS"))
+saveRDS(hab.sum, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "out", "hab_sum_site.RDS"))
 # saveRDS(hab.sum2, file.path(pipeline, "out", "hab_sum_site.RDS"))
 
 ```

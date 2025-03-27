@@ -10,8 +10,8 @@ knitr::opts_chunk$set(echo = TRUE)
 
 NAME <- '5_ModelSelection' ## Name of the R file goes here (without the file extension!)
 PROJECT <- 'Archive' ## Project folder
-PROJECT_DIR <- "E:/CE_analysis" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
-
+PROJECT_DIR <- "C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds" ## Change this to the directory in which your project folder is located, make sure to avoid using single backslashes 
+pipeline<-"2_pipeline/5_ModelSelection"
 ##Set working directory
 #setwd(file.path(PROJECT_DIR, PROJECT))
 knitr::opts_knit$set(root.dir = file.path(PROJECT_DIR, PROJECT))
@@ -62,26 +62,33 @@ The tree complexity, learning rate, and bag fraction were determined more or les
 Unfortunately, I don't think these BRT will run with a negbinom model, so I am using poisson.
 
 ```{r}
-counts.spec <- readRDS("E:/Archive/2_pipeline/4_DataExploration/store/counts_simp.RDS")
-hab.sum <- readRDS("E:/Archive/2_pipeline/4_DataExploration/store/hab.sum_simp.RDS")
+counts.spec <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/4_DataExploration/store/counts_simp.RDS")
+
+#just removed noise.tag.abun because it is NA
+counts.spec <- lapply(counts.spec, function(df) df[ , !(names(df) %in% "noise.tag.abun")])
+
+hab.sum <- readRDS("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds/2_pipeline/4_DataExploration/store/hab.sum_simp.RDS")
+
+#count.df<-count.df%>%select(!noise.tag.abun)#IDK IF THIs IS IMPORTANT
 
 set.seed(1234)
 brt <- list()
 for(i in 1:length(counts.spec)){
-count.df <- counts.spec[[i]] %>%
-  select(siteID, offset, abundance, buffer, perARU, starts_with("noise"), starts_with("h_"),  starts_with("wden"), -h_forest, - h_forest_closed) %>% 
-  pivot_wider(names_from = buffer, values_from = c(starts_with("h_"),  starts_with("wden"))) 
-count.df <- left_join(count.df, hab.sum %>% select(siteID, year, elev, starts_with("mn_"), lon, lat) %>% distinct())
-count.df <- as.data.frame(count.df)
+  count.df <- counts.spec[[i]] %>%
+  select(siteID, offset, abundance, buffer, perARU, starts_with("noise"), starts_with("h_"),  starts_with("wden"), -h_forest)%>% 
+  pivot_wider(names_from = buffer, values_from = c(starts_with("h_"),  starts_with("wden")))
 
-my.brt <-gbm.step(data = count.df, gbm.x = 4:length(names(count.df)), gbm.y = "abundance", offset = count.df$offset,
+  count.df <- left_join(count.df, hab.sum %>% select(siteID, year, elev, starts_with("mn_"), lon, lat) %>% distinct())
+  count.df <- as.data.frame(count.df)
+
+  my.brt <-gbm.step(data = count.df, gbm.x = 4:length(names(count.df)), gbm.y = "abundance", offset = count.df$offset,
                   family = "poisson", tree.complexity = 3, learning.rate = .0005, bag.fraction = .65, n.folds = 15)
 
-brt[[i]] <- my.brt
+  brt[[i]] <- my.brt
 }
 names(brt) <- names(counts.spec)
-saveRDS(brt, file.path("E:/Archive",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
-brt <- readRDS(file.path("E:/Archive",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
+saveRDS(brt, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
+brt <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "brt_tc4_lr.001_bf.65.RDS"))
 brt <- brt[!sapply(brt, is.null)] ##BOWA and PIGR didn't converge
 
 ##BRT goodness of fit
@@ -123,10 +130,10 @@ brt.trees>1000 #NOFL, WEWP, WISN
 # topVar_tc3_lr.0005_bf.65$WISN
 #low number of trees indicates instability, not suggested to use models with fewer than 1000 trees. Top variables are constent across these different models though, so let's keep :)
 
-gbm.plot(brt$YEWA, smooth = T, n.plots = 12, plot.layout=c(3, 4)) #plot 12 most influential variables
+gbm.plot(brt$VATH, smooth = T, n.plots = 12, plot.layout=c(3, 4)) #plot 12 most influential variables
 
 int.brt <- lapply(brt, function(my.brt) gbm.interactions(my.brt))
-saveRDS(int.brt, file.path(pipeline, "store", "intbrt_tc4_lr.001_bf.65.RDS"))
+saveRDS(int.brt, file.path('C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds',pipeline, "store", "intbrt_tc4_lr.001_bf.65.RDS"))
 
 ```
 
@@ -322,8 +329,8 @@ m.l <- mapply(function(m1, m2) {
       }
   }, m1.l, m2.l, SIMPLIFY = F)
 
-saveRDS(mset.l, file.path("E:/Archive",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ##AIC comparison per species.
-saveRDS(m.l, file.path("E:/Archive",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ## 'top' models
+saveRDS(mset.l, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ##AIC comparison per species.
+saveRDS(m.l, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "mset_top2BTR_surface_noforest.RDS")) ## 'top' models
 
 
 
@@ -496,7 +503,7 @@ saveRDS(m.l, file.path(pipeline, "store", "mset_top2BTR_lden_noforest.RDS")) ## 
 
 
 
-### if brt included disturbance variables----
+#if brt included disturbance variables----
 # mset.l <- list()
 # m1.l <- list()
 # m2.l <- list()
@@ -605,7 +612,7 @@ saveRDS(m.l, file.path(pipeline, "store", "mset_top2BTR_lden_noforest.RDS")) ## 
 #   }, m1.l, m2.l, SIMPLIFY = F)
 # 
 # saveRDS(mset.l, file.path(pipeline, "store", "mset_top1.5BTR.RDS")) ##AIC comparison per species.
-# saveRDS(m.l, file.path(pipeline, "store", "bestm_top1.5BTR.RDS")) ## 'top' models
+#saveRDS(m.l, file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "bestm_top1.5BTR.RDS")) ## 'top' models
 
 
 ```
@@ -649,7 +656,7 @@ m.set %>% filter(delta <2) %>% arrange(df, delta)
 # Model Validation
 
 ```{r}
-m.l <- readRDS(file.path("E:/Archive",pipeline, "store", "bestm_topBTR.RDS"))
+m.l <- readRDS(file.path("C:/Users/azeller/OneDrive - Wildlife Conservation Society/Documents/CE_birds",pipeline, "store", "bestm_topBTR.RDS"))
 
 ## check residuals
 
